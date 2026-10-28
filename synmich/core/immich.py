@@ -795,7 +795,12 @@ class ImmichClient:
                 continue
             dev_aid = a.get("deviceAssetId")
             if dev_aid and a.get("libraryId") is None:
-                device_idx[str(dev_aid)] = str(aid)
+                dev_str = str(dev_aid)
+                device_idx[dev_str] = str(aid)
+                if "_synoid" in dev_str:
+                    _, _, suffix = dev_str.rpartition("_synoid")
+                    if suffix:
+                        device_idx.setdefault(f"synoid:{suffix}", str(aid))
             name = a.get("originalFileName")
             if not name:
                 continue

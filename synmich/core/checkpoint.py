@@ -271,8 +271,9 @@ class Checkpoint:
         self.data: Dict[str, Any] = self._load()
 
     def _seed_from_peer_checkpoints(self, d: Dict[str, Any]) -> None:
-        """Carry over per-user `syno_to_immich` mappings from older checkpoints
-        for the same Synology + Immich servers when users are added/removed.
+        """Carry over per-user `syno_to_immich` mappings and `timeline_done`
+        flags from older checkpoints for the same Synology + Immich servers
+        when users are added/removed or renamed (e.g. 'Maria' -> 'mariapaz').
 
         Does NOT copy `albums_done` so shared albums are re-evaluated with the
         expanded user set, and does NOT write to disk until `save()` is called.
@@ -289,12 +290,11 @@ class Checkpoint:
         ).rstrip("/")
         if not syno_url or not immich_url:
             return
-        config_users = {
-            u.get("name", "")
-            for u in self._config.get("users", [])
-            if u.get("name")
-        }
-        if not config_users:
+        users_cfg = [
+            u for u in self._config.get("users", [])
+            if isinstance(u, dict) and (u.get("name") or u.get("syno_username"))
+        ]
+        if not users_cfg:
             return
         index = _load_index()
         peers = []
@@ -308,6 +308,31 @@ class Checkpoint:
                 if p.exists():
                     peers.append((meta.get("last_used") or "", p))
         peers.sort(key=lambda item: item[0])
+
+        def _match_peer_user(u_cfg: Dict[str, Any], peer_keys: List[str]) -> Optional[str]:
+            u_name = u_cfg.get("name") or ""
+            u_syno = u_cfg.get("syno_username") or ""
+            candidates = [c for c in (u_name, u_syno) if c]
+            # 1) Exact match
+            for c in candidates:
+                if c in peer_keys:
+                    return c
+            # 2) Case-insensitive match
+            lower_map = {pk.lower(): pk for pk in peer_keys}
+            for c in candidates:
+                if c.lower() in lower_map:
+                    return lower_map[c.lower()]
+            # 3) Prefix match (e.g. display name "Maria" <-> syno_username "mariapaz")
+            for c in candidates:
+                cl = c.lower()
+                pref_hits = [
+                    pk for pk in peer_keys
+                    if pk.lower().startswith(cl) or cl.startswith(pk.lower())
+                ]
+                if len(pref_hits) == 1:
+                    return pref_hits[0]
+            return None
+
         for _, peer_path in peers:
             try:
                 with open(peer_path, encoding="utf-8") as f:
@@ -315,11 +340,21 @@ class Checkpoint:
             except Exception:
                 continue
             peer_map = peer_data.get("syno_to_immich") or {}
-            for u in config_users:
-                if u in peer_map and isinstance(peer_map[u], dict):
-                    d.setdefault("syno_to_immich", {}).setdefault(u, {}).update(
-                        peer_map[u]
+            peer_tl = peer_data.get("timeline_done") or {}
+            peer_keys = list(peer_map.keys())
+            for u_cfg in users_cfg:
+                u_name = u_cfg.get("name") or u_cfg.get("syno_username") or ""
+                if not u_name:
+                    continue
+                peer_u = _match_peer_user(u_cfg, peer_keys)
+                if peer_u and isinstance(peer_map.get(peer_u), dict):
+                    target = d.setdefault("syno_to_immich", {}).setdefault(
+                        u_name, {}
                     )
+                    for k, v in peer_map[peer_u].items():
+                        target.setdefault(k, v)
+                if peer_u and peer_tl.get(peer_u) is True:
+                    d.setdefault("timeline_done", {}).setdefault(u_name, True)
 
     def _load(self) -> Dict[str, Any]:
         if not self.path.exists():
@@ -340,6 +375,7 @@ class Checkpoint:
             d["counters"].setdefault("linked", 0)
             d["counters"].setdefault("failed", 0)
             d["counters"].setdefault("skipped_already_done", 0)
+            self._seed_from_peer_checkpoints(d)
             return d
         except Exception as e:
             log.warning("Could not load checkpoint, using default: %s", e)

@@ -166,7 +166,7 @@ def prompt_user(parent, existing=None, mode="migrate", syno_url="",
             def done():
                 if ok_:
                     result.update(vals)
-                    if needs_syno:
+                    if needs_syno and not result.get("name"):
                         result["name"] = vals.get("syno_username", "")
                     if var_ext is not None:
                         result["external_library"] = bool(var_ext.get())

@@ -804,6 +804,12 @@ class Migrator:
         expected_dev_id = device_asset_id(uploader.name, syno_id)
         if expected_dev_id in dev_map:
             return dev_map[expected_dev_id]
+        if f"synoid:{syno_id}" in dev_map:
+            return dev_map[f"synoid:{syno_id}"]
+        suffix = f"_synoid{syno_id}"
+        for k, v in dev_map.items():
+            if isinstance(k, str) and k.endswith(suffix):
+                return v
 
         # For non-live items, also allow matching an existing internal-storage
         # asset (`libraryId is None`) when both filename and capture timestamp match.

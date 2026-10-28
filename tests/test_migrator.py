@@ -760,6 +760,8 @@ def test_internal_user_reuses_existing_immich_assets_without_redownload(tmp_path
     }
     maria.immich.last_device_asset_index = {
         "maria_synoid501": "imm-existing-501",
+        "Maria_synoid503": "imm-existing-live-503",
+        "synoid:503": "imm-existing-live-503",
     }
 
     cp = Checkpoint(path=tmp_path / "cp.json")
@@ -781,11 +783,18 @@ def test_internal_user_reuses_existing_immich_assets_without_redownload(tmp_path
         tmp_path,
         maria,
     )
+    id3, _ = mig._process_one_asset(
+        {"id": 503, "filename": "live_photo.heic", "type": "live", "owner_user_id": 1, "time": 1_700_000_000},
+        tmp_path,
+        maria,
+    )
 
     assert id1 == "imm-existing-501"
     assert id2 == "imm-existing-502"
-    assert mig.stats.duplicate == 2
+    assert id3 == "imm-existing-live-503"
+    assert mig.stats.duplicate == 3
     syno_maria.download.assert_not_called()
+    syno_maria.download_live_photo.assert_not_called()
     maria.immich.upload_asset.assert_not_called()
 
 
@@ -799,15 +808,17 @@ def test_checkpoint_seeds_user_mappings_when_adding_more_users(tmp_path, monkeyp
     }
     cp1 = Checkpoint(config=cfg_one_user)
     cp1.mark_uploaded("maria", "777", "imm-maria-777")
+    cp1.mark_timeline_done("maria")
     cp1.mark_album_done("local-maria-1")
     cp1.save()
 
-    # Now expand config to 5 users on the same servers -> new checkpoint hash
+    # Now expand config to 5 users on the same servers (and rename display name
+    # 'maria' -> 'mariapaz' via syno_username) -> new checkpoint hash
     cfg_five_users = {
         "synology": {"url": "http://192.168.1.10:5000"},
         "immich": {"url": "http://192.168.1.20:2283"},
         "users": [
-            {"name": "maria", "syno_username": "maria"},
+            {"name": "mariapaz", "syno_username": "mariapaz"},
             {"name": "u2", "syno_username": "u2"},
             {"name": "u3", "syno_username": "u3"},
             {"name": "u4", "syno_username": "u4"},
@@ -816,7 +827,8 @@ def test_checkpoint_seeds_user_mappings_when_adding_more_users(tmp_path, monkeyp
     }
     cp2 = Checkpoint(config=cfg_five_users)
     assert cp2.path != cp1.path
-    assert cp2.is_uploaded("maria", "777") == "imm-maria-777"
+    assert cp2.is_uploaded("mariapaz", "777") == "imm-maria-777"
+    assert cp2.is_timeline_done("mariapaz")
     assert not cp2.is_album_done("local-maria-1")
 
 
