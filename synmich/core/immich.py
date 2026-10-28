@@ -59,6 +59,7 @@ class ImmichClient:
         self._partner_ids: List[str] = []
         self._restorable_partner_ids: List[str] = []
         self._partner_fallback_assets: List[Dict[str, Any]] = []
+        self.last_device_asset_index: Dict[str, str] = {}
 
     def close(self) -> None:
         for pid in list(self._restorable_partner_ids):
@@ -686,10 +687,12 @@ class ImmichClient:
 
         return self._retry(_do)
 
-    def iter_assets(self, page_size: int = 1000):
+    def iter_assets(
+        self, page_size: int = 1000, include_partners: bool = True
+    ):
         """Yield every asset visible to this API key, across ALL libraries
         (the user's upload library, external libraries, AND timelines shared
-        with this user by partners).
+        with this user by partners when `include_partners=True`).
 
         Paginates POST /search/metadata. `withExif` is requested so each
         item carries `exifInfo.dateTimeOriginal`, which external-library
@@ -701,7 +704,9 @@ class ImmichClient:
         content-checksum dedup can never match a file that lives in an
         external library; matching has to be done on metadata instead.
         """
-        partner_ids = self._ensure_partners_searchable()
+        partner_ids = (
+            self._ensure_partners_searchable() if include_partners else []
+        )
         seen_ids = set()
         seen_owners = set()
         page = 1
@@ -757,7 +762,7 @@ class ImmichClient:
                     yield it
 
     def build_filename_index(
-        self, page_size: int = 1000
+        self, page_size: int = 1000, include_partners: bool = True
     ) -> Dict[str, List[Tuple[str, Optional[str], Optional[str], Optional[str]]]]:
         """Index existing Immich assets by filename for external-library mode.
 
@@ -769,14 +774,30 @@ class ImmichClient:
         prefer the external asset over a leftover upload-library copy. The
         path lets the matcher break ties when the same external asset exists
         in more than one Immich external library.
+
+        Also populates `self.last_device_asset_index` ({deviceAssetId: asset_id})
+        for internal-storage assets (`libraryId is None`) so upload users can
+        reuse previously uploaded assets without re-downloading from Synology.
         """
         index: Dict[
             str, List[Tuple[str, Optional[str], Optional[str], Optional[str]]]
         ] = {}
-        for a in self.iter_assets(page_size=page_size):
-            name = a.get("originalFileName")
+        device_idx: Dict[str, str] = {}
+        try:
+            assets_iter = self.iter_assets(
+                page_size=page_size, include_partners=include_partners
+            )
+        except TypeError:
+            assets_iter = self.iter_assets(page_size=page_size)
+        for a in assets_iter:
             aid = a.get("id")
-            if not name or not aid:
+            if not aid:
+                continue
+            dev_aid = a.get("deviceAssetId")
+            if dev_aid and a.get("libraryId") is None:
+                device_idx[str(dev_aid)] = str(aid)
+            name = a.get("originalFileName")
+            if not name:
                 continue
             dto = (a.get("exifInfo") or {}).get("dateTimeOriginal") or a.get(
                 "fileCreatedAt"
@@ -784,6 +805,7 @@ class ImmichClient:
             index.setdefault(name.lower(), []).append(
                 (aid, dto, a.get("libraryId"), a.get("originalPath"))
             )
+        self.last_device_asset_index = device_idx
         return index
 
     def find_assets_by_filename(

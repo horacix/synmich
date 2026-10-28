@@ -237,7 +237,22 @@ def build_sessions(cfg, otp_provider=None, with_immich=True,
         sessions.append(UserSession(
             name=name, syno=syno, immich=immich,
             syno_user_id=syno_id or (len(sessions) + 1),
-            immich_user_id=immich_user_id))
+            immich_user_id=immich_user_id,
+            external_library=u.get("external_library"),
+        ))
+
+    if with_immich:
+        shared_key = (
+            cfg.get("migration", {}).get("shared_space_immich_api_key") or ""
+        ).strip()
+        if shared_key:
+            try:
+                ImmichClient(immich_url, shared_key).me()
+            except Exception:  # noqa: BLE001
+                raise RuntimeError(
+                    "Immich connection failed for Shared Space API key. "
+                    "Check the Shared Space Immich API key."
+                )
     return sessions
 
 
@@ -291,6 +306,7 @@ def humanize_error(msg) -> str:
         ("syno_password", "A user has no Synology password."),
         (".name is missing", "A user has no name."),
         ("shared_albums_mode", "The shared-albums mode is invalid."),
+        ("shared_space_mode", "The Shared Space mode is invalid."),
         ("albums_mode", "The albums mode is invalid."),
     ]
     if "shared_space_owner" in m and owner:

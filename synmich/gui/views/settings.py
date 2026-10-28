@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-from synmich.config import save_config
+from synmich.config import is_user_external_library, save_config
 from synmich.gui import widgets as W
 from synmich.gui.dialogs import prompt_user
 
@@ -173,8 +173,13 @@ class SettingsView(ctk.CTkFrame):
             W.primary_button(row, "Edit", lambda i=i: self._edit_user(i),
                              color=W.BLUE, hover=W.BLUE_DK, width=56,
                              height=28).pack(side="right", pady=6)
+            uname = u.get("syno_username") or u.get("name") or "?"
+            badge = ""
+            if self._mode == "migrate":
+                is_ext = is_user_external_library(u, self.cfg.get("migration"))
+                badge = "  [EXT]" if is_ext else "  [UPLOAD]"
             ctk.CTkLabel(
-                row, text=f"  {u.get('syno_username') or u.get('name') or '?'}",
+                row, text=f"  {uname}{badge}",
                 anchor="w", text_color=W.TEXT, font=W.font(13, "bold")).pack(
                 side="left", fill="x", expand=True, padx=6)
 

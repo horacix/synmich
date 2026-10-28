@@ -272,15 +272,34 @@ def run_wizard() -> int:
             "of re-uploading duplicates. Unmatched photos are reported for retry, not uploaded."
         )
         config["migration"]["external_library_mode"] = _confirm(
-            "Use external-library mode?",
+            "Use external-library mode for ALL users?",
             default=False,
         )
+        if not config["migration"]["external_library_mode"] and len(users) > 1:
+            if _confirm(
+                "Are SOME users already mounted as external libraries in Immich?",
+                default=False,
+            ):
+                for u in users:
+                    u["external_library"] = _confirm(
+                        f"  Is {u['name']} an external library in Immich (link only, skip timeline)?",
+                        default=False,
+                    )
 
-    config["migration"]["include_shared_space"] = _confirm(
-        "Migrate Shared Space photos? (recommended if you use it)",
+    console.print()
+    muted("  How should Synology Shared Space (FotoTeam) be handled?")
+    muted("    [bold]upload[/]    Download from Synology and upload to a chosen Immich user")
+    muted("    [bold]external[/]  Already in Immich as an external library (link into albums)")
+    muted("    [bold]ignore[/]    Skip Shared Space")
+    ss_mode = Prompt.ask(
+        "  [bold]Shared Space mode[/]",
+        choices=["upload", "external", "ignore"],
+        default="upload",
     )
+    config["migration"]["shared_space_mode"] = ss_mode
+    config["migration"]["include_shared_space"] = (ss_mode != "ignore")
 
-    if config["migration"]["include_shared_space"]:
+    if ss_mode == "upload":
         names = [u["name"] for u in users]
         muted("  Who should own these photos in Immich? (recommended: your main account)")
         owner = Prompt.ask(
@@ -289,6 +308,18 @@ def run_wizard() -> int:
             default=names[0],
         )
         config["migration"]["shared_space_owner"] = owner
+    elif ss_mode == "external":
+        muted(
+            "  Optional: if a dedicated Immich user (not in the Synology user list above) "
+            "holds the Shared Space external library and shares it via Partner Sharing, "
+            "enter their Immich API key so synmich can index it directly."
+        )
+        ss_key = _ask(
+            "Dedicated Shared Space Immich API key (press Enter to skip)",
+            default="",
+            password=True,
+        )
+        config["migration"]["shared_space_immich_api_key"] = (ss_key or "").strip()
 
     parallel = _confirm(
         "Use parallel mode (faster)?", default=True

@@ -574,3 +574,249 @@ def test_dry_run_counts_items_without_persisting_checkpoint(tmp_path):
     mig.sessions[0].immich.create_album.assert_not_called()
     mig.sessions[0].immich.upload_asset.assert_not_called()
 
+
+def test_config_validation_for_hybrid_and_shared_space_modes():
+    from synmich.config import (
+        is_user_external_library,
+        resolve_shared_space_mode,
+        validate_config,
+    )
+
+    base = {
+        "synology": {"url": "http://192.168.1.10:5000"},
+        "immich": {"url": "http://192.168.1.20:2283"},
+        "users": [
+            {
+                "name": "maria",
+                "syno_username": "maria",
+                "syno_password": "pw",
+                "immich_api_key": "k1",
+                "external_library": False,
+            },
+            {
+                "name": "ext1",
+                "syno_username": "ext1",
+                "syno_password": "pw",
+                "immich_api_key": "k2",
+                "external_library": True,
+            },
+        ],
+        "migration": {
+            "albums_mode": "all",
+            "shared_albums_mode": "link",
+            "shared_space_mode": "external",
+            "shared_space_owner": "",
+            "shared_space_immich_api_key": "k-shared-6th",
+            "external_library_mode": False,
+        },
+    }
+    assert validate_config(base) == []
+    assert resolve_shared_space_mode(base["migration"]) == "external"
+    assert is_user_external_library(base["users"][0], base["migration"]) is False
+    assert is_user_external_library(base["users"][1], base["migration"]) is True
+
+    # When shared_space_mode is upload, shared_space_owner must be a valid user if set
+    upload_cfg = {
+        **base,
+        "migration": {
+            **base["migration"],
+            "shared_space_mode": "upload",
+            "shared_space_owner": "nonexistent",
+        },
+    }
+    errs = validate_config(upload_cfg)
+    assert any("shared_space_owner" in e for e in errs)
+
+
+def test_hybrid_users_timeline_skips_external_and_uploads_internal(tmp_path):
+    syno_ext = MagicMock()
+    syno_int = MagicMock()
+    photo = tmp_path / "p.jpg"
+    photo.write_bytes(b"jpg")
+    syno_int.download.return_value = photo
+    syno_int.list_items.return_value = [
+        {"id": 101, "filename": "p.jpg", "type": "photo", "owner_user_id": 2}
+    ]
+
+    ext_user = UserSession(
+        name="ext_user",
+        syno=syno_ext,
+        immich=MagicMock(),
+        syno_user_id=1,
+        immich_user_id="imm-ext",
+        external_library=True,
+    )
+    int_user = UserSession(
+        name="maria",
+        syno=syno_int,
+        immich=MagicMock(),
+        syno_user_id=2,
+        immich_user_id="imm-maria",
+        external_library=False,
+    )
+    int_user.immich.upload_asset.return_value = ("imm-asset-101", False, None)
+
+    cp = Checkpoint(path=tmp_path / "cp.json")
+    mig = Migrator(
+        config={
+            "migration": {"external_library_mode": False},
+            "execution": {"mode": "sequential"},
+        },
+        sessions=[ext_user, int_user],
+        checkpoint=cp,
+        stats=MigrationStats(),
+        control=MigrationControl(),
+    )
+
+    mig.run_timeline()
+
+    syno_ext.list_items.assert_not_called()
+    syno_int.list_items.assert_called_once()
+    assert cp.is_uploaded("maria", "101") == "imm-asset-101"
+    assert cp.is_timeline_done("maria")
+
+
+def test_shared_space_external_mode_links_via_sixth_user_and_skips_upload(tmp_path):
+    syno_maria = MagicMock()
+    photo = tmp_path / "maria_own.jpg"
+    photo.write_bytes(b"jpg")
+    syno_maria.download.return_value = photo
+
+    maria = UserSession(
+        name="maria",
+        syno=syno_maria,
+        immich=MagicMock(),
+        syno_user_id=1,
+        immich_user_id="imm-maria",
+        external_library=False,
+    )
+    maria.immich.create_album.return_value = "alb-maria-1"
+    maria.immich.add_assets_to_album.return_value = (2, 0)
+    maria.immich.upload_asset.return_value = ("imm-maria-own", False, None)
+
+    shared_immich = MagicMock()
+    shared_immich.build_filename_index.return_value = {
+        "shared_pic.jpg": [
+            ("imm-shared-999", "2023-11-14T22:13:20+00:00", "lib-shared", "/shared/shared_pic.jpg")
+        ]
+    }
+
+    cp = Checkpoint(path=tmp_path / "cp.json")
+    mig = Migrator(
+        config={
+            "migration": {
+                "shared_space_mode": "external",
+                "external_library_mode": False,
+            },
+            "execution": {"mode": "sequential"},
+        },
+        sessions=[maria],
+        checkpoint=cp,
+        stats=MigrationStats(),
+        control=MigrationControl(),
+        shared_space_immich=shared_immich,
+    )
+
+    # Album owned by maria (internal upload user) containing:
+    # 1) maria's personal photo (owner_user_id=1 -> uploaded)
+    # 2) a Shared Space photo (owner_user_id=0 -> linked from 6th user's external library)
+    syno_maria.list_items.return_value = [
+        {"id": 10, "filename": "maria_own.jpg", "type": "photo", "owner_user_id": 1, "time": 1_700_000_000},
+        {"id": 20, "filename": "shared_pic.jpg", "type": "photo", "owner_user_id": 0, "time": 1_700_000_000},
+    ]
+    album = {"id": 5, "name": "Mixed Album", "owner_user_id": 1, "shared": False}
+    mig._process_album(album)
+
+    assert mig.stats.uploaded == 1
+    assert mig.stats.linked == 1
+    assert cp.is_uploaded("maria", "10") == "imm-maria-own"
+    assert cp.is_uploaded("__shared_space__", "20") == "imm-shared-999"
+    maria.immich.add_assets_to_album.assert_called_once_with(
+        "alb-maria-1", ["imm-maria-own", "imm-shared-999"]
+    )
+
+    # run_shared_space() must skip uploading when shared_space_mode == "external"
+    mig.run_shared_space()
+    syno_maria.list_shared_space_items.assert_not_called()
+
+
+def test_internal_user_reuses_existing_immich_assets_without_redownload(tmp_path):
+    syno_maria = MagicMock()
+    maria = UserSession(
+        name="maria",
+        syno=syno_maria,
+        immich=MagicMock(),
+        syno_user_id=1,
+        immich_user_id="imm-maria",
+        external_library=False,
+    )
+    # Maria already has assets in Immich internal storage from previous testing:
+    # - item 501 matched by deviceAssetId ("maria_synoid501")
+    # - item 502 matched by filename + timestamp in internal storage (libraryId=None)
+    maria.immich.build_filename_index.return_value = {
+        "already_there.jpg": [
+            ("imm-existing-502", "2023-11-14T22:13:20+00:00", None, "/upload/already_there.jpg")
+        ]
+    }
+    maria.immich.last_device_asset_index = {
+        "maria_synoid501": "imm-existing-501",
+    }
+
+    cp = Checkpoint(path=tmp_path / "cp.json")
+    mig = Migrator(
+        config={"migration": {}, "execution": {"mode": "sequential"}},
+        sessions=[maria],
+        checkpoint=cp,
+        stats=MigrationStats(),
+        control=MigrationControl(),
+    )
+
+    id1, _ = mig._process_one_asset(
+        {"id": 501, "filename": "any.jpg", "type": "photo", "owner_user_id": 1},
+        tmp_path,
+        maria,
+    )
+    id2, _ = mig._process_one_asset(
+        {"id": 502, "filename": "already_there.jpg", "type": "photo", "owner_user_id": 1, "time": 1_700_000_000},
+        tmp_path,
+        maria,
+    )
+
+    assert id1 == "imm-existing-501"
+    assert id2 == "imm-existing-502"
+    assert mig.stats.duplicate == 2
+    syno_maria.download.assert_not_called()
+    maria.immich.upload_asset.assert_not_called()
+
+
+def test_checkpoint_seeds_user_mappings_when_adding_more_users(tmp_path, monkeypatch):
+    monkeypatch.setenv("SYNMICH_CONFIG_DIR", str(tmp_path))
+
+    cfg_one_user = {
+        "synology": {"url": "http://192.168.1.10:5000"},
+        "immich": {"url": "http://192.168.1.20:2283"},
+        "users": [{"name": "maria", "syno_username": "maria"}],
+    }
+    cp1 = Checkpoint(config=cfg_one_user)
+    cp1.mark_uploaded("maria", "777", "imm-maria-777")
+    cp1.mark_album_done("local-maria-1")
+    cp1.save()
+
+    # Now expand config to 5 users on the same servers -> new checkpoint hash
+    cfg_five_users = {
+        "synology": {"url": "http://192.168.1.10:5000"},
+        "immich": {"url": "http://192.168.1.20:2283"},
+        "users": [
+            {"name": "maria", "syno_username": "maria"},
+            {"name": "u2", "syno_username": "u2"},
+            {"name": "u3", "syno_username": "u3"},
+            {"name": "u4", "syno_username": "u4"},
+            {"name": "u5", "syno_username": "u5"},
+        ],
+    }
+    cp2 = Checkpoint(config=cfg_five_users)
+    assert cp2.path != cp1.path
+    assert cp2.is_uploaded("maria", "777") == "imm-maria-777"
+    assert not cp2.is_album_done("local-maria-1")
+
+

@@ -41,7 +41,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "immich": {
         "url": "",
     },
-    # List of {name, syno_username, syno_password, immich_api_key}
+    # List of {name, syno_username, syno_password, immich_api_key, external_library?}
     "users": [],
     "migration": {
         "include_albums": True,
@@ -69,12 +69,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # to the album WITHOUT re-uploading — avoiding the duplicate copy that
         # Immich's checksum dedup can't catch for external assets (see
         # immich-app/immich#7804). Unmatched photos are reported for retry.
+        # Can also be overridden per user via users[i].external_library.
         "external_library_mode": False,
         # Opt in to uploading unmatched photos (may create external duplicates).
         "external_library_fallback_upload": False,
         "include_shared_space": True,
-        # Name of the user who becomes owner of Shared Space photos
+        # How to handle Synology Shared Space (FotoTeam, owner_user_id=0):
+        #   ""         - auto (derived from include_shared_space /
+        #                shared_space_immich_api_key / external_library_mode)
+        #   "upload"   - download and upload Shared Space items to shared_space_owner
+        #   "external" - Shared Space already lives in Immich as an external
+        #                library (link album items only, never upload)
+        #   "ignore"   - skip Shared Space
+        "shared_space_mode": "",
+        # Name of the user who becomes owner of Shared Space photos (upload mode)
         "shared_space_owner": "",
+        # Optional Immich API key of a dedicated Immich account holding the
+        # Shared Space external library (indexed once for linking across all users).
+        "shared_space_immich_api_key": "",
         # Default Immich role for users with "view" permission on Syno
         # (users with "upload" permission always become "editor")
         "share_role": "editor",
@@ -101,6 +113,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "work_dir": "./synmich_backup",
     },
 }
+
+
+def resolve_shared_space_mode(mig: Optional[Dict[str, Any]]) -> str:
+    """Resolve effective Shared Space mode: 'upload', 'external', or 'ignore'."""
+    mig = mig or {}
+    raw = str(mig.get("shared_space_mode") or "").strip().lower()
+    if raw in ("upload", "external", "ignore"):
+        return raw
+    if not mig.get("include_shared_space", True):
+        return "ignore"
+    if (mig.get("shared_space_immich_api_key") or "").strip():
+        return "external"
+    if mig.get("external_library_mode", False):
+        return "external"
+    return "upload"
+
+
+def is_user_external_library(
+    user_cfg: Optional[Dict[str, Any]],
+    mig_cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return True if this user's personal photos live in an Immich external library."""
+    if isinstance(user_cfg, dict) and "external_library" in user_cfg and user_cfg["external_library"] is not None:
+        return bool(user_cfg["external_library"])
+    return bool((mig_cfg or {}).get("external_library_mode", False))
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -191,7 +228,14 @@ def validate_config(data: Dict[str, Any]) -> List[str]:
             f"must be 'all' or 'select'"
         )
 
-    if mig.get("include_shared_space"):
+    ssm = (mig.get("shared_space_mode") or "").strip().lower()
+    if ssm and ssm not in ("upload", "external", "ignore"):
+        errors.append(
+            f"migration.shared_space_mode='{ssm}' "
+            f"must be 'upload', 'external', or 'ignore'"
+        )
+
+    if resolve_shared_space_mode(mig) == "upload":
         owner = mig.get("shared_space_owner")
         if owner and owner not in [u.get("name") for u in users]:
             errors.append(
@@ -200,4 +244,3 @@ def validate_config(data: Dict[str, Any]) -> List[str]:
             )
 
     return errors
-

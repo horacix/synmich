@@ -18,7 +18,7 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from synmich.config import save_config
+from synmich.config import resolve_shared_space_mode, save_config
 from synmich.core.checkpoint import Checkpoint
 from synmich.core.migrator import Migrator, MigrationControl, MigrationStats
 from synmich.gui import widgets as W
@@ -142,19 +142,24 @@ class MigrationView(ctk.CTkFrame):
             corner_radius=0, border_width=2, font=W.font(12)).pack(
             anchor="w", pady=(12, 0))
 
-        # Shared Space (FotoTeam): migrate shared library items and assign
-        # them to the selected owner in Immich.
+        # Shared Space (FotoTeam): upload to a user, link from an external
+        # library (optionally owned by a dedicated 6th Immich user), or skip.
+        ctk.CTkLabel(c.body, text="Synology Shared Space (FotoTeam)",
+                     text_color=W.TEXT, font=W.font(13, "bold")).pack(
+            anchor="w", pady=(12, 2))
+        ss_mode_map = {
+            "upload": "Upload to owner",
+            "external": "External library",
+            "ignore": "Skip",
+        }
+        init_ss = ss_mode_map.get(resolve_shared_space_mode(mig), "Upload to owner")
+        self.toggle_shared_space = W.SquareToggle(
+            c.body, ["Upload to owner", "External library", "Skip"],
+            init_ss, command=self._toggle_shared_space_owner, width=140)
+        self.toggle_shared_space.pack(anchor="w", pady=(2, 2))
+        # Backward-compat BooleanVar synced with toggle_shared_space
         self.var_shared_space = ctk.BooleanVar(
-            value=bool(mig.get("include_shared_space", True)))
-        ctk.CTkCheckBox(
-            c.body,
-            text="Import Synology Shared Space photos",
-            variable=self.var_shared_space,
-            command=self._toggle_shared_space_owner,
-            fg_color=W.GREEN, hover_color=W.GREEN_DK,
-            checkbox_width=20, checkbox_height=20,
-            corner_radius=0, border_width=2, font=W.font(12)).pack(
-            anchor="w", pady=(6, 0))
+            value=(init_ss != "Skip"))
         self.shared_owner_row = ctk.CTkFrame(c.body, fg_color="transparent")
         ctk.CTkLabel(
             self.shared_owner_row,
@@ -167,19 +172,28 @@ class MigrationView(ctk.CTkFrame):
             dropdown_hover_color=W.HOVER, text_color="white",
             corner_radius=0, width=180, height=28, font=W.font(12))
         self.opt_shared_owner.pack(side="left")
+        self.shared_ext_row = ctk.CTkFrame(c.body, fg_color="transparent")
+        ctk.CTkLabel(
+            self.shared_ext_row,
+            text="Dedicated Shared Space Immich API key (optional 6th user):",
+            text_color=W.MUTED, font=W.font(11)).pack(side="left", padx=(26, 8))
+        self.e_shared_api_key = ctk.CTkEntry(
+            self.shared_ext_row, corner_radius=0, width=240, show="*",
+            placeholder_text="Leave blank to search partners")
+        self.e_shared_api_key.pack(side="left")
+        if mig.get("shared_space_immich_api_key"):
+            self.e_shared_api_key.insert(0, mig["shared_space_immich_api_key"])
         self._shared_space_anchor = ctk.CTkFrame(c.body, height=0,
                                                  fg_color="transparent")
         self._shared_space_anchor.pack(anchor="w")
 
-        # External-library mode: link existing assets instead of re-uploading
-        # duplicates when the photos already live in Immich via an external
-        # library (see immich-app/immich#7804).
+        # External-library mode: default fallback when per-user external_library
+        # is not explicitly set on a user in Settings.
         self.var_external = ctk.BooleanVar(
             value=bool(mig.get("external_library_mode", False)))
         ctk.CTkCheckBox(
             c.body,
-            text="Photos already in Immich via an external library "
-                 "(link only; unmatched photos reported for retry)",
+            text="Default all users to external library mode unless overridden per user in Settings",
             variable=self.var_external, fg_color=W.GREEN,
             hover_color=W.GREEN_DK, checkbox_width=20, checkbox_height=20,
             corner_radius=0, border_width=2, font=W.font(12)).pack(
@@ -232,12 +246,17 @@ class MigrationView(ctk.CTkFrame):
         desc = {n: d for n, _v, d in W.SHARED_MODES}.get(name, "")
         self.lbl_shared.configure(text=desc)
 
-    def _toggle_shared_space_owner(self):
-        if self.var_shared_space.get():
+    def _toggle_shared_space_owner(self, _val=None):
+        choice = self.toggle_shared_space.get()
+        self.var_shared_space.set(choice != "Skip")
+        self.shared_owner_row.pack_forget()
+        self.shared_ext_row.pack_forget()
+        if choice == "Upload to owner":
             self.shared_owner_row.pack(anchor="w", pady=(4, 0),
                                        before=self._shared_space_anchor)
-        else:
-            self.shared_owner_row.pack_forget()
+        elif choice == "External library":
+            self.shared_ext_row.pack(anchor="w", pady=(4, 0),
+                                     before=self._shared_space_anchor)
 
     def _on_dry_run_toggle(self):
         if self.var_dry_run.get():
@@ -359,9 +378,29 @@ class MigrationView(ctk.CTkFrame):
         mig["shared_albums_mode"] = W.SHARED_TO_INTERNAL.get(
             self.toggle_shared.get(), "link")
         mig["include_timeline"] = bool(self.var_timeline.get())
-        mig["include_shared_space"] = bool(self.var_shared_space.get())
+        toggle_ss = getattr(self, "toggle_shared_space", None)
+        if toggle_ss is not None:
+            ss_choice = toggle_ss.get()
+            ss_rev = {
+                "Upload to owner": "upload",
+                "External library": "external",
+                "Skip": "ignore",
+            }
+            ss_mode = ss_rev.get(ss_choice, "upload")
+            if hasattr(self, "var_shared_space") and not self.var_shared_space.get():
+                ss_mode = "ignore"
+            mig["shared_space_mode"] = ss_mode
+            mig["include_shared_space"] = (ss_mode != "ignore")
+        else:
+            mig["include_shared_space"] = bool(self.var_shared_space.get())
+            ss_mode = "upload" if mig["include_shared_space"] else "ignore"
         owner = (self.opt_shared_owner.get() or "").strip()
-        mig["shared_space_owner"] = owner if mig["include_shared_space"] else ""
+        mig["shared_space_owner"] = owner if ss_mode == "upload" else ""
+        e_key = getattr(self, "e_shared_api_key", None)
+        if e_key is not None:
+            mig["shared_space_immich_api_key"] = (
+                e_key.get().strip() if ss_mode == "external" else ""
+            )
         mig["external_library_mode"] = bool(self.var_external.get())
         if mig["albums_mode"] == "select":
             mig["selected_albums"] = [

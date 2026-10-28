@@ -250,6 +250,7 @@ class Checkpoint:
         If config is provided, use the path derived from the config hash.
         If path is provided explicitly, use it as-is (legacy).
         """
+        self._config = config
         if config is not None:
             # Try to migrate a legacy checkpoint if not done yet
             migrate_legacy_checkpoint(config)
@@ -269,9 +270,62 @@ class Checkpoint:
         self.lock = threading.Lock()
         self.data: Dict[str, Any] = self._load()
 
+    def _seed_from_peer_checkpoints(self, d: Dict[str, Any]) -> None:
+        """Carry over per-user `syno_to_immich` mappings from older checkpoints
+        for the same Synology + Immich servers when users are added/removed.
+
+        Does NOT copy `albums_done` so shared albums are re-evaluated with the
+        expanded user set, and does NOT write to disk until `save()` is called.
+        """
+        if not self._config:
+            return
+        syno_url = (
+            self._config.get("synology", {}).get("url")
+            or self._config.get("synology", {}).get("base_url", "")
+        ).rstrip("/")
+        immich_url = (
+            self._config.get("immich", {}).get("url")
+            or self._config.get("immich", {}).get("base_url", "")
+        ).rstrip("/")
+        if not syno_url or not immich_url:
+            return
+        config_users = {
+            u.get("name", "")
+            for u in self._config.get("users", [])
+            if u.get("name")
+        }
+        if not config_users:
+            return
+        index = _load_index()
+        peers = []
+        for h, meta in index.items():
+            if h == self._config_hash:
+                continue
+            m_syno = (meta.get("synology_url") or "").rstrip("/")
+            m_imm = (meta.get("immich_url") or "").rstrip("/")
+            if m_syno == syno_url and m_imm == immich_url:
+                p = get_checkpoints_dir() / f"{h}.json"
+                if p.exists():
+                    peers.append((meta.get("last_used") or "", p))
+        peers.sort(key=lambda item: item[0])
+        for _, peer_path in peers:
+            try:
+                with open(peer_path, encoding="utf-8") as f:
+                    peer_data = json.load(f)
+            except Exception:
+                continue
+            peer_map = peer_data.get("syno_to_immich") or {}
+            for u in config_users:
+                if u in peer_map and isinstance(peer_map[u], dict):
+                    d.setdefault("syno_to_immich", {}).setdefault(u, {}).update(
+                        peer_map[u]
+                    )
+
     def _load(self) -> Dict[str, Any]:
         if not self.path.exists():
-            return self._default()
+            d = self._default()
+            self._seed_from_peer_checkpoints(d)
+            return d
         try:
             with open(self.path) as f:
                 d = json.load(f)

@@ -192,7 +192,26 @@ def _build_sessions(
                 immich=immich,
                 syno_user_id=syno_id,
                 immich_user_id=me["id"],
+                external_library=u.get("external_library"),
             )
+        )
+
+    mig = config.get("migration", {}) or {}
+    shared_key = (mig.get("shared_space_immich_api_key") or "").strip()
+    if shared_key:
+        shared_immich = ImmichClient(
+            immich_url,
+            shared_key,
+            max_retries=max_retries,
+            retry_backoff_s=backoff,
+        )
+        try:
+            me_shared = shared_immich.me()
+        except Exception as e:
+            error(f"Immich /me failed for Shared Space account: {e}")
+            return None
+        success(
+            f"  ✓ Immich Shared Space → {me_shared.get('email')}"
         )
 
     return sessions
@@ -396,6 +415,7 @@ def cmd_users(args) -> int:
     )
     table.add_column("Name", style="bold")
     table.add_column("Synology user")
+    table.add_column("Mode")
     table.add_column("Synology status")
     table.add_column("Immich status")
 
@@ -404,6 +424,8 @@ def cmd_users(args) -> int:
         "verify_ssl", False
     )
     immich_url = config["immich"]["url"]
+    from synmich.config import is_user_external_library
+    mig_cfg = config.get("migration", {})
 
     for u in config["users"]:
         syno = SynologyClient(syno_url, verify_ssl=verify_ssl)
@@ -426,9 +448,16 @@ def cmd_users(args) -> int:
         except Exception:
             imm_status = "[red]✗[/]"
 
+        mode_str = (
+            "[cyan]external[/]"
+            if is_user_external_library(u, mig_cfg)
+            else "[green]upload[/]"
+        )
+
         table.add_row(
             u["name"],
             u["syno_username"],
+            mode_str,
             syno_status,
             imm_status,
         )

@@ -78,7 +78,7 @@ def prompt_user(parent, existing=None, mode="migrate", syno_url="",
         "backup": ("Synology login only - no Immich key needed for local "
                    "backup."),
     }
-    heights = {"migrate": 520, "manage": 420, "backup": 390}
+    heights = {"migrate": 560, "manage": 420, "backup": 390}
     title = titles[mode][0 if existing else 1]
     add_label = "Save" if existing else "Add account"
 
@@ -115,12 +115,26 @@ def prompt_user(parent, existing=None, mode="migrate", syno_url="",
             e.insert(0, existing[key])
         entries[key] = e
 
+    var_ext = None
     if mode == "migrate":
         ctk.CTkLabel(
             dlg, text="The API key must belong to this same user's Immich "
             "account (Immich -> Account Settings -> API Keys).",
             text_color=W.ORANGE, font=W.font(10), wraplength=420,
             justify="left").pack(fill="x", padx=22, pady=(0, 6))
+        var_ext = ctk.BooleanVar(
+            value=bool(existing.get("external_library", False))
+            if existing else False
+        )
+        ctk.CTkCheckBox(
+            dlg,
+            text="Personal photos already in Immich via an external library "
+                 "(link only, skip timeline)",
+            variable=var_ext,
+            fg_color=W.GREEN, hover_color=W.GREEN_DK,
+            checkbox_width=20, checkbox_height=20,
+            corner_radius=0, border_width=2, font=W.font(11),
+        ).pack(anchor="w", padx=22, pady=(2, 6))
 
     status = ctk.CTkLabel(dlg, text="", text_color=W.MUTED, font=W.font(11),
                           wraplength=410, justify="left")
@@ -154,6 +168,8 @@ def prompt_user(parent, existing=None, mode="migrate", syno_url="",
                     result.update(vals)
                     if needs_syno:
                         result["name"] = vals.get("syno_username", "")
+                    if var_ext is not None:
+                        result["external_library"] = bool(var_ext.get())
                     state["committed"] = True
                     dlg.destroy()
                 else:

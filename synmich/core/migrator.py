@@ -345,6 +345,7 @@ class UserSession:
     syno_user_id: int
     immich_user_id: str
     output_dir_name: str = ""
+    external_library: Optional[bool] = None
 
 
 def safe_name(name: str) -> str:
@@ -394,6 +395,7 @@ class Migrator:
         stats: MigrationStats,
         control: MigrationControl,
         dry_run: bool = False,
+        shared_space_immich: Optional[ImmichClient] = None,
     ):
         self.config = config
         self.sessions = sessions
@@ -410,6 +412,21 @@ class Migrator:
         }
 
         mig = config.get("migration", {})
+
+        # Populate per-user external_library flag from config["users"] if unset
+        users_cfg_by_name = {
+            (u.get("name") or u.get("syno_username") or ""): u
+            for u in (config.get("users") or [])
+            if isinstance(u, dict)
+        }
+        for s in self.sessions:
+            if s.external_library is None:
+                u_cfg = users_cfg_by_name.get(s.name)
+                if (
+                    isinstance(u_cfg, dict)
+                    and u_cfg.get("external_library") is not None
+                ):
+                    s.external_library = bool(u_cfg["external_library"])
 
         # Shared Space owner
         owner_name = mig.get("shared_space_owner", "")
@@ -445,6 +462,9 @@ class Migrator:
         self.include_shared_space = bool(
             mig.get("include_shared_space", True)
         )
+        self.shared_space_mode = (
+            str(mig.get("shared_space_mode") or "").strip().lower()
+        )
 
         # Parallel mode
         exec_cfg = config.get("execution", {})
@@ -457,6 +477,36 @@ class Migrator:
 
         self.delete_after = bool(
             exec_cfg.get("delete_after_upload", True)
+        )
+
+        # Optional 6th Immich user holding the Shared Space external library
+        shared_key = (mig.get("shared_space_immich_api_key") or "").strip()
+        immich_url = (config.get("immich") or {}).get("url", "").strip()
+        if (
+            shared_space_immich is None
+            and shared_key
+            and immich_url
+            and not dry_run
+        ):
+            shared_space_immich = ImmichClient(
+                immich_url,
+                shared_key,
+                max_retries=int(exec_cfg.get("max_retries", 5)),
+                retry_backoff_s=int(
+                    exec_cfg.get("retry_backoff_seconds", 3)
+                ),
+            )
+        self.shared_space_session: Optional[UserSession] = (
+            UserSession(
+                name="__shared_space__",
+                syno=None,  # type: ignore[arg-type]
+                immich=shared_space_immich,
+                syno_user_id=0,
+                immich_user_id="",
+                external_library=True,
+            )
+            if shared_space_immich is not None
+            else None
         )
 
         # External-library mode (v2.2.0). When the photos already live in
@@ -480,6 +530,8 @@ class Migrator:
             str, Dict[str, List[Tuple[str, Optional[str], Optional[str]]]]
         ] = {}
         self._asset_index_lock = threading.Lock()
+        self._internal_device_index: Dict[str, Dict[str, str]] = {}
+        self._internal_index_checked: Set[str] = set()
         # Per-(uploader, filename) cache for the targeted fallback lookup we
         # run when the bulk index misses a name (the bulk scan can drop assets
         # at page boundaries). Caches negatives too, so a genuinely-absent
@@ -517,6 +569,51 @@ class Migrator:
         # Defaults
         for s in self.sessions:
             s.output_dir_name = safe_name(s.name).lower()
+
+    def _is_session_external(self, session: Optional[UserSession]) -> bool:
+        """Return True if `session` uses an external library in Immich."""
+        if session is not None and session.external_library is not None:
+            return bool(session.external_library)
+        return bool(self.external_library_mode)
+
+    def _effective_shared_space_mode(self) -> str:
+        """Return effective Shared Space mode: 'upload', 'external', or 'ignore'."""
+        raw = (self.shared_space_mode or "").strip().lower()
+        if raw in ("upload", "external", "ignore"):
+            return raw
+        if not self.include_shared_space:
+            return "ignore"
+        if self.shared_space_session is not None or self.external_library_mode:
+            return "external"
+        return "upload"
+
+    def _any_external_mode(self) -> bool:
+        """Return True if any user or Shared Space uses external-library mode."""
+        if self.external_library_mode:
+            return True
+        if self._effective_shared_space_mode() == "external":
+            return True
+        return any(self._is_session_external(s) for s in self.sessions)
+
+    def _is_item_external(
+        self, item: Dict[str, Any], uploader: UserSession
+    ) -> bool:
+        """Return True if `item` should be linked from an external library
+        rather than downloaded and uploaded to Immich internal storage.
+        """
+        owner_uid = item.get("owner_user_id")
+        if owner_uid == 0:
+            ss_mode = self._effective_shared_space_mode()
+            if ss_mode == "external":
+                return True
+            if ss_mode == "upload":
+                return self._is_session_external(uploader)
+            return self._is_session_external(uploader)
+        if owner_uid is not None:
+            owner_sess = self.syno_id_to_session.get(owner_uid)
+            if owner_sess is not None:
+                return self._is_session_external(owner_sess)
+        return self._is_session_external(uploader)
 
     @staticmethod
     def _compile_re(pattern: str):
@@ -595,17 +692,26 @@ class Migrator:
         return True
 
     def _determine_uploader(
-        self, owner_user_id: Optional[int]
+        self,
+        owner_user_id: Optional[int],
+        default_owner: Optional[UserSession] = None,
     ) -> Optional[UserSession]:
         if owner_user_id == 0 or owner_user_id is None:
-            return self.shared_owner
+            if (
+                owner_user_id == 0
+                and default_owner is not None
+                and self._effective_shared_space_mode() == "external"
+            ):
+                return default_owner
+            return self.shared_owner or default_owner
         return (
             self.syno_id_to_session.get(owner_user_id)
+            or default_owner
             or self.shared_owner
         )
 
     def _get_asset_index(
-        self, uploader: UserSession
+        self, uploader: UserSession, include_partners: bool = True
     ) -> Dict[str, List[Tuple[str, Optional[str], Optional[str]]]]:
         """Return (building once) the filename index for an uploader.
 
@@ -617,18 +723,36 @@ class Migrator:
             idx = self._asset_index.get(uploader.name)
             if idx is not None:
                 return idx
+            label = (
+                "Shared Space"
+                if uploader.name == "__shared_space__"
+                else uploader.name
+            )
             self._log(
                 f"🔎 Indexing existing Immich assets for "
-                f"{uploader.name} (external-library mode)…"
+                f"{label}…"
             )
             try:
-                idx = uploader.immich.build_filename_index()
+                if not include_partners:
+                    try:
+                        idx = uploader.immich.build_filename_index(
+                            include_partners=False
+                        )
+                    except TypeError:
+                        idx = uploader.immich.build_filename_index()
+                else:
+                    idx = uploader.immich.build_filename_index()
             except Exception as e:
                 self._log(
                     f"⚠ Could not index Immich assets for "
-                    f"{uploader.name}: {e} — checking filenames individually"
+                    f"{label}: {e} — checking filenames individually"
                 )
                 idx = {}
+            if not isinstance(idx, dict):
+                idx = {}
+            dev_idx = getattr(uploader.immich, "last_device_asset_index", None)
+            if isinstance(dev_idx, dict):
+                self._internal_device_index[uploader.name] = dict(dev_idx)
             self._asset_index[uploader.name] = idx
             total = sum(len(v) for v in idx.values())
             self._log(
@@ -636,6 +760,76 @@ class Migrator:
                 f"{len(idx)} filename(s)"
             )
             return idx
+
+    def _find_existing_internal_asset(
+        self, uploader: UserSession, item: Dict[str, Any]
+    ) -> Optional[str]:
+        """Check if an internal-storage user already has `item` uploaded in
+        Immich (e.g. from an earlier test run or before adding more users),
+        so we can reuse its asset_id without re-downloading from Synology.
+        """
+        with self._asset_index_lock:
+            already_indexed = uploader.name in self._internal_index_checked
+            if not already_indexed:
+                self._internal_index_checked.add(uploader.name)
+        if not already_indexed and uploader.name not in self._asset_index:
+            try:
+                try:
+                    idx = uploader.immich.build_filename_index(
+                        include_partners=False
+                    )
+                except TypeError:
+                    idx = uploader.immich.build_filename_index()
+            except Exception:
+                idx = {}
+            with self._asset_index_lock:
+                if isinstance(idx, dict):
+                    self._asset_index[uploader.name] = idx
+                    total = sum(len(v) for v in idx.values())
+                    if total > 0:
+                        self._log(
+                            f"🔎 Found {total} existing asset(s) in "
+                            f"{uploader.name}'s Immich library for reuse"
+                        )
+                else:
+                    self._asset_index[uploader.name] = {}
+                dev_idx = getattr(
+                    uploader.immich, "last_device_asset_index", None
+                )
+                if isinstance(dev_idx, dict):
+                    self._internal_device_index[uploader.name] = dict(dev_idx)
+
+        syno_id = str(item["id"])
+        dev_map = self._internal_device_index.get(uploader.name) or {}
+        expected_dev_id = device_asset_id(uploader.name, syno_id)
+        if expected_dev_id in dev_map:
+            return dev_map[expected_dev_id]
+
+        # For non-live items, also allow matching an existing internal-storage
+        # asset (`libraryId is None`) when both filename and capture timestamp match.
+        if item.get("type") == "live":
+            return None
+        filename = item.get("filename", "")
+        capture = self._item_timestamp(item)
+        if not filename or capture is None:
+            return None
+        idx = self._asset_index.get(uploader.name) or {}
+        candidates = idx.get(filename.lower()) or []
+        internal_candidates = [
+            c
+            for c in candidates
+            if len(c) >= 2
+            and c[1] is not None
+            and (len(c) < 3 or c[2] is None)
+        ]
+        if not internal_candidates:
+            return None
+        return match_existing_asset(
+            {filename.lower(): internal_candidates},
+            filename,
+            capture,
+            owner_name=uploader.name,
+        )
 
     def _lookup_by_filename(
         self, uploader: UserSession, filename: str
@@ -664,6 +858,8 @@ class Migrator:
                 f"⚠ Fallback lookup failed for {filename}: {e}"
             )
             candidates = []
+        if not isinstance(candidates, list):
+            candidates = []
         with self._fallback_lock:
             self._fallback_cache[key] = candidates
         return candidates
@@ -673,6 +869,7 @@ class Migrator:
         uploader: UserSession,
         filename: str,
         capture: Optional[float],
+        item_owner_id: Optional[int] = None,
     ) -> Tuple[Optional[str], UserSession, Set[str]]:
         """Search `uploader` (and any other configured sessions) for an
         existing Immich asset matching `filename` + `capture`.
@@ -680,17 +877,34 @@ class Migrator:
         Returns (matched_asset_id, session_that_matched, seen_candidate_ids).
         """
         candidate_ids: Set[str] = set()
-        sessions_to_try = [uploader] + [
-            s for s in self.sessions if s.name != uploader.name
-        ]
+        sessions_to_try: List[UserSession] = []
+        if item_owner_id == 0 and self.shared_space_session is not None:
+            sessions_to_try.append(self.shared_space_session)
+        if uploader not in sessions_to_try:
+            sessions_to_try.append(uploader)
+        if (
+            self.shared_space_session is not None
+            and self.shared_space_session not in sessions_to_try
+        ):
+            sessions_to_try.append(self.shared_space_session)
+        for s in self.sessions:
+            if s not in sessions_to_try:
+                sessions_to_try.append(s)
+
         for sess in sessions_to_try:
-            index = self._get_asset_index(sess)
+            include_partners = sess.name != "__shared_space__"
+            index = self._get_asset_index(
+                sess, include_partners=include_partners
+            )
             idx_candidates = index.get(filename.lower()) or []
             for c in idx_candidates:
                 if c and c[0]:
                     candidate_ids.add(c[0])
+            owner_hint = (
+                None if sess.name == "__shared_space__" else sess.name
+            )
             existing_id = match_existing_asset(
-                index, filename, capture, owner_name=sess.name
+                index, filename, capture, owner_name=owner_hint
             )
             if existing_id is None:
                 # Bulk index miss isn't proof the asset is absent — the
@@ -712,7 +926,7 @@ class Migrator:
                         {filename.lower(): merged},
                         filename,
                         capture,
-                        owner_name=sess.name,
+                        owner_name=owner_hint,
                     )
             if existing_id:
                 return existing_id, sess, candidate_ids
@@ -737,12 +951,18 @@ class Migrator:
             return None, uploader.name
 
         syno_id = str(item["id"])
+        item_owner_id = item.get("owner_user_id")
+        is_external = self._is_item_external(item, uploader)
 
         # Already uploaded?
         existing = self.checkpoint.is_uploaded(
             uploader.name, syno_id
         )
-        if existing and not self.external_library_mode:
+        if not existing and item_owner_id == 0 and is_external:
+            existing = self.checkpoint.is_uploaded(
+                "__shared_space__", syno_id
+            )
+        if existing and not is_external:
             return existing, uploader.name
 
         # Video filter — note that "live" type is an iPhone Live Photo
@@ -764,7 +984,7 @@ class Migrator:
         if self.dry_run:
             verb = (
                 ("link-or-upload" if self.external_library_fallback_upload else "link-only")
-                if self.external_library_mode
+                if is_external
                 else "download+upload"
             )
             self._log(
@@ -777,23 +997,37 @@ class Migrator:
         # External-library mode: if the photo already exists in Immich (it's
         # served from an external library), link that asset to the album
         # instead of downloading and re-uploading a duplicate copy.
-        if self.external_library_mode:
+        if is_external:
             filename = item.get("filename", "")
             capture = self._item_timestamp(item)
             existing_id, matched_sess, candidate_ids = (
-                self._find_external_match(uploader, filename, capture)
+                self._find_external_match(
+                    uploader, filename, capture, item_owner_id=item_owner_id
+                )
             )
             if existing_id:
                 if existing and existing != existing_id:
                     with self._replaced_lock:
                         self._replaced_assets.add(existing)
+                # If matched via the dedicated Shared Space 6th user, attribute
+                # the album addition to `uploader` (the album owner, who has
+                # partner access to the 6th user) and cache in checkpoint.
+                attr_sess = (
+                    uploader
+                    if matched_sess.name == "__shared_space__"
+                    else matched_sess
+                )
                 if existing != existing_id:
                     self.checkpoint.mark_linked(
-                        matched_sess.name, syno_id, existing_id
+                        attr_sess.name, syno_id, existing_id
                     )
+                    if matched_sess.name == "__shared_space__":
+                        self.checkpoint.mark_linked(
+                            "__shared_space__", syno_id, existing_id
+                        )
                     self.stats.bump("linked")
                     self._log(f"🔗 Linked (external): {filename}")
-                return existing_id, matched_sess.name
+                return existing_id, attr_sess.name
             if existing:
                 if existing in candidate_ids:
                     # Previously linked to a same-named asset whose capture
@@ -817,6 +1051,19 @@ class Migrator:
                 f"↑ No external match for {filename} — "
                 f"uploading"
             )
+        else:
+            # Internal-storage user: check if this photo is already uploaded in
+            # the user's Immich internal storage before downloading from Synology.
+            reused_id = self._find_existing_internal_asset(uploader, item)
+            if reused_id:
+                self.checkpoint.mark_duplicate(
+                    uploader.name, syno_id, reused_id
+                )
+                self.stats.bump("duplicate")
+                self._log(
+                    f"♻ Reused existing internal asset: {item.get('filename')}"
+                )
+                return reused_id, uploader.name
 
         # Download
         if not self.control.check():
@@ -948,7 +1195,9 @@ class Migrator:
         return asset_id, uploader.name
 
     def _album_needs_external_recheck(
-        self, album_items: List[Dict[str, Any]]
+        self,
+        album_items: List[Dict[str, Any]],
+        default_owner: Optional[UserSession] = None,
     ) -> bool:
         """Return True if a completed album has unlinked items (e.g. partner
         items skipped by older builds) or false-matched items whose capture
@@ -961,18 +1210,29 @@ class Migrator:
                 continue
             if not self._in_date_range(it):
                 continue
-            uploader = self._determine_uploader(it.get("owner_user_id"))
+            uploader = self._determine_uploader(
+                it.get("owner_user_id"), default_owner=default_owner
+            )
             if not uploader:
+                continue
+            if not self._is_item_external(it, uploader):
                 continue
             syno_id = str(it["id"])
             existing = self.checkpoint.is_uploaded(uploader.name, syno_id)
+            if not existing and it.get("owner_user_id") == 0:
+                existing = self.checkpoint.is_uploaded(
+                    "__shared_space__", syno_id
+                )
             if not existing:
                 return True
             filename = it.get("filename", "")
             capture = self._item_timestamp(it)
             if capture is not None and filename:
                 matched_id, _, candidate_ids = self._find_external_match(
-                    uploader, filename, capture
+                    uploader,
+                    filename,
+                    capture,
+                    item_owner_id=it.get("owner_user_id"),
                 )
                 if matched_id and matched_id != existing:
                     return True
@@ -1007,13 +1267,20 @@ class Migrator:
         is_shared = bool(album.get("shared")) or bool(
             sharing.get("permission")
         )
+        listed_by_sess = self.sessions_by_name.get(
+            album.get("_listed_by", "")
+        )
         if owner_syno_id == 0:
             owner_guess = self.shared_owner
         else:
-            owner_guess = self.syno_id_to_session.get(owner_syno_id) or (
-                self.shared_owner
-                if is_shared or self.external_library_mode
-                else None
+            owner_guess = (
+                self.syno_id_to_session.get(owner_syno_id)
+                or (listed_by_sess if not is_shared else None)
+                or (
+                    self.shared_owner
+                    if is_shared or self._any_external_mode()
+                    else None
+                )
             )
         owner_name = owner_guess.name if owner_guess else ""
         passphrase = album_key(owner_name, album) if owner_name else (
@@ -1033,7 +1300,7 @@ class Migrator:
         )
         if already_done and owner_guess and (
             self.checkpoint.has_failed_items()
-            or self.external_library_mode
+            or self._any_external_mode()
         ):
             # Older versions marked albums done despite failed downloads or
             # skipped/mis-linked partner items in external-library mode.
@@ -1048,9 +1315,11 @@ class Migrator:
                 already_done = False
                 self._log(f"↻ Retrying failed items in previously completed album: {name}")
             elif (
-                self.external_library_mode
+                self._any_external_mode()
                 and isinstance(album_items, list)
-                and self._album_needs_external_recheck(album_items)
+                and self._album_needs_external_recheck(
+                    album_items, default_owner=owner_guess
+                )
             ):
                 already_done = False
                 self._log(f"↻ Re-evaluating incomplete or mis-linked items in album: {name}")
@@ -1083,12 +1352,14 @@ class Migrator:
         if owner_syno_id == 0:
             owner = self.shared_owner
         else:
-            owner = self.syno_id_to_session.get(
-                owner_syno_id
-            ) or (
-                self.shared_owner
-                if is_shared or self.external_library_mode
-                else None
+            owner = (
+                self.syno_id_to_session.get(owner_syno_id)
+                or (listed_by_sess if not is_shared else None)
+                or (
+                    self.shared_owner
+                    if is_shared or self._any_external_mode()
+                    else None
+                )
             )
 
         if not owner:
@@ -1170,11 +1441,17 @@ class Migrator:
 
         if self.workers <= 1:
             self._process_items_sequential(
-                items, folder, uploaded_by_uploader
+                items,
+                folder,
+                uploaded_by_uploader,
+                default_owner=owner,
             )
         else:
             self._process_items_parallel(
-                items, folder, uploaded_by_uploader
+                items,
+                folder,
+                uploaded_by_uploader,
+                default_owner=owner,
             )
 
         if not self.control.check():
@@ -1367,11 +1644,17 @@ class Migrator:
 
             if self.workers <= 1:
                 self._process_items_sequential(
-                    user_items, folder, uploaded_by_uploader
+                    user_items,
+                    folder,
+                    uploaded_by_uploader,
+                    default_owner=user_session,
                 )
             else:
                 self._process_items_parallel(
-                    user_items, folder, uploaded_by_uploader
+                    user_items,
+                    folder,
+                    uploaded_by_uploader,
+                    default_owner=user_session,
                 )
 
             if not self.control.check():
@@ -1464,12 +1747,14 @@ class Migrator:
         items: List[Dict[str, Any]],
         folder: Path,
         uploaded_by_uploader: Dict[str, List[str]],
+        default_owner: Optional[UserSession] = None,
     ) -> None:
         for item in items:
             if not self.control.check():
                 return
             uploader = self._determine_uploader(
-                item.get("owner_user_id")
+                item.get("owner_user_id"),
+                default_owner=default_owner,
             )
             if not uploader:
                 continue
@@ -1489,6 +1774,7 @@ class Migrator:
         items: List[Dict[str, Any]],
         folder: Path,
         uploaded_by_uploader: Dict[str, List[str]],
+        default_owner: Optional[UserSession] = None,
     ) -> None:
         with ThreadPoolExecutor(
             max_workers=self.workers
@@ -1498,7 +1784,8 @@ class Migrator:
                 if not self.control.check():
                     break
                 uploader = self._determine_uploader(
-                    item.get("owner_user_id")
+                    item.get("owner_user_id"),
+                    default_owner=default_owner,
                 )
                 if not uploader:
                     continue
@@ -1580,7 +1867,7 @@ class Migrator:
                         ):
                             excluded_shared += 1
                     continue
-                all_albums.append(a)
+                all_albums.append({**a, "_listed_by": session.name})
 
         self.stats.albums_total = len(all_albums)
         if self.albums_mode == "select":
@@ -1620,6 +1907,15 @@ class Migrator:
         for session in self.sessions:
             if not self.control.check():
                 break
+
+            if (
+                self._is_session_external(session)
+                and not self.external_library_fallback_upload
+            ):
+                self._log(
+                    f"⏭ Timeline {session.name} skipped (external library)"
+                )
+                continue
 
             if self.checkpoint.is_timeline_done(
                 session.name
@@ -1661,11 +1957,17 @@ class Migrator:
 
             if self.workers <= 1:
                 self._process_items_sequential(
-                    items, folder, uploaded_by_uploader
+                    items,
+                    folder,
+                    uploaded_by_uploader,
+                    default_owner=session,
                 )
             else:
                 self._process_items_parallel(
-                    items, folder, uploaded_by_uploader
+                    items,
+                    folder,
+                    uploaded_by_uploader,
+                    default_owner=session,
                 )
 
             if not self.control.check():
@@ -1687,7 +1989,13 @@ class Migrator:
         timeline) were skipped. Photos already uploaded via an album are
         skipped by the checkpoint.
         """
-        if not self.include_shared_space:
+        ss_mode = self._effective_shared_space_mode()
+        if ss_mode == "ignore":
+            return
+        if ss_mode == "external":
+            self._log(
+                "⏭ Shared Space timeline skipped (external library mode)"
+            )
             return
         owner = self.shared_owner
         if not owner:
@@ -1722,11 +2030,17 @@ class Migrator:
 
         if self.workers <= 1:
             self._process_items_sequential(
-                items, folder, uploaded_by_uploader
+                items,
+                folder,
+                uploaded_by_uploader,
+                default_owner=owner,
             )
         else:
             self._process_items_parallel(
-                items, folder, uploaded_by_uploader
+                items,
+                folder,
+                uploaded_by_uploader,
+                default_owner=owner,
             )
 
         if not self.control.check():
@@ -1783,7 +2097,7 @@ class Migrator:
                 self.run_albums()
 
             if (
-                self.include_shared_space
+                self._effective_shared_space_mode() != "ignore"
                 and self.control.check()
             ):
                 self.run_shared_space()
@@ -1802,6 +2116,11 @@ class Migrator:
             for session in self.sessions:
                 session.syno.close_downloads()
                 session.immich.close()
+            if (
+                self.shared_space_session
+                and self.shared_space_session.immich
+            ):
+                self.shared_space_session.immich.close()
             self._log(
                 f"Transfer totals: {self.stats.downloaded_bytes / (1024 * 1024):.1f} MiB "
                 f"downloaded; download={self.stats.download_seconds:.2f} worker-s; "
