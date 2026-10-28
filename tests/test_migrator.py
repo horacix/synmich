@@ -466,3 +466,83 @@ def test_eta_and_rate_reset_when_starting_another_album():
         assert stats.elapsed_seconds() == 3600.0
         assert stats.eta_seconds() == 9.0
         assert stats.rate_per_minute() == 600.0
+
+
+def test_partner_owned_synology_items_and_albums_fallback_to_shared_owner(tmp_path):
+    syno = MagicMock()
+    mig = _migrator(tmp_path, syno)
+    mig.external_library_mode = True
+    uploader = mig.sessions[0]
+    uploader.immich.create_album.return_value = "album-partner"
+    uploader.immich.add_assets_to_album.return_value = (1, 0)
+    mig._asset_index["cyrille"] = {
+        "img_1234.heic": [
+            ("partner-asset-1", "2023-11-14T22:13:20+00:00", "lib-partner", "/homes/partner/IMG_1234.HEIC")
+        ]
+    }
+    # owner_user_id=2 belongs to the unconfigured partner on Synology
+    syno.list_items.return_value = [
+        {"id": 99, "filename": "IMG_1234.HEIC", "type": "photo", "owner_user_id": 2, "time": 1_700_000_000}
+    ]
+    album = {"id": 10, "name": "Partner Album", "owner_user_id": 2, "shared": True, "passphrase": "p1"}
+    mig._process_album(album)
+
+    assert mig.checkpoint.is_album_done("p1")
+    assert mig.checkpoint.is_uploaded("cyrille", "99") == "partner-asset-1"
+    uploader.immich.add_assets_to_album.assert_called_once_with("album-partner", ["partner-asset-1"])
+
+
+def test_wrong_date_bulk_index_candidate_falls_through_to_targeted_lookup(tmp_path):
+    syno = MagicMock()
+    mig = _migrator(tmp_path, syno)
+    mig.external_library_mode = True
+    uploader = mig.sessions[0]
+    # Bulk index only had user's own photo with same name from 2021
+    mig._asset_index["cyrille"] = {
+        "img_1234.heic": [
+            ("own-wrong-date", "2021-01-01T00:00:00+00:00", "lib-own", "/homes/cyrille/IMG_1234.HEIC")
+        ]
+    }
+    # Targeted lookup returns partner's photo with the matching 2023 date
+    uploader.immich.find_assets_by_filename.return_value = [
+        ("own-wrong-date", "2021-01-01T00:00:00+00:00", "lib-own", "/homes/cyrille/IMG_1234.HEIC"),
+        ("partner-hit", "2023-11-14T22:13:20+00:00", "lib-partner", "/homes/partner/IMG_1234.HEIC"),
+    ]
+    item = {"id": 77, "filename": "IMG_1234.HEIC", "type": "photo", "time": 1_700_000_000}
+
+    asset_id, _ = mig._process_one_asset(item, tmp_path, uploader)
+    assert asset_id == "partner-hit"
+    assert mig.checkpoint.is_uploaded("cyrille", "77") == "partner-hit"
+
+
+def test_completed_album_with_false_matched_random_photo_is_repaired(tmp_path):
+    syno = MagicMock()
+    mig = _migrator(tmp_path, syno)
+    mig.external_library_mode = True
+    uploader = mig.sessions[0]
+    uploader.immich.create_album.return_value = "album-1"
+    uploader.immich.add_assets_to_album.return_value = (1, 0)
+    uploader.immich.remove_assets_from_album.return_value = 1
+
+    # Previously, syno item 88 was false-matched to "own-wrong-date" and album marked done
+    mig.checkpoint.mark_linked("cyrille", "88", "own-wrong-date")
+    mig.checkpoint.mark_album_done("p-repair")
+
+    # Now index has both the wrong-date own photo and the right-date partner photo
+    mig._asset_index["cyrille"] = {
+        "img_5555.heic": [
+            ("own-wrong-date", "2020-05-01T00:00:00+00:00", "lib-own", "/homes/cyrille/IMG_5555.HEIC"),
+            ("partner-right-date", "2023-11-14T22:13:20+00:00", "lib-partner", "/homes/partner/IMG_5555.HEIC"),
+        ]
+    }
+    syno.list_items.return_value = [
+        {"id": 88, "filename": "IMG_5555.HEIC", "type": "photo", "owner_user_id": 2, "time": 1_700_000_000}
+    ]
+    album = {"id": 12, "name": "Shared Trip", "owner_user_id": 1, "shared": True, "passphrase": "p-repair"}
+
+    mig._process_album(album)
+
+    assert mig.checkpoint.is_uploaded("cyrille", "88") == "partner-right-date"
+    uploader.immich.remove_assets_from_album.assert_called_once_with("album-1", ["own-wrong-date"])
+    uploader.immich.add_assets_to_album.assert_called_once_with("album-1", ["partner-right-date"])
+    assert mig.checkpoint.is_album_done("p-repair")

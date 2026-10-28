@@ -55,8 +55,18 @@ class ImmichClient:
         self.retry_backoff_s = retry_backoff_s
         self.timeout = timeout
         self._http_pool = SessionPool()
+        self._partners_checked = False
+        self._partner_ids: List[str] = []
+        self._restorable_partner_ids: List[str] = []
+        self._partner_fallback_assets: List[Dict[str, Any]] = []
 
     def close(self) -> None:
+        for pid in list(self._restorable_partner_ids):
+            try:
+                self.set_partner_in_timeline(pid, False)
+            except Exception:
+                pass
+        self._restorable_partner_ids.clear()
         self._http_pool.close()
 
     def _request(self, method: str, *args, **kwargs):
@@ -107,6 +117,196 @@ class ImmichClient:
             return r.json()
 
         return self._retry(_do)
+
+    def list_partners(
+        self, direction: str = "shared-with"
+    ) -> List[Dict[str, Any]]:
+        """Return partner accounts sharing their timeline with this user."""
+        try:
+            r = self._retry(
+                lambda: self._request(
+                    "get",
+                    f"{self.base_url}/partners",
+                    headers=self._headers(),
+                    params={"direction": direction},
+                    timeout=self.timeout,
+                )
+            )
+            if getattr(r, "status_code", None) != 200:
+                return []
+            payload = r.json()
+            if not isinstance(payload, list):
+                return []
+            return [
+                p
+                for p in payload
+                if isinstance(p, dict) and isinstance(p.get("id"), str)
+            ]
+        except Exception:
+            return []
+
+    def set_partner_in_timeline(
+        self, partner_id: str, in_timeline: bool
+    ) -> bool:
+        """Update whether a partner's assets are included in timeline/search."""
+        try:
+            r = self._retry(
+                lambda: self._request(
+                    "put",
+                    f"{self.base_url}/partners/{partner_id}",
+                    headers=self._headers(
+                        {"Content-Type": "application/json"}
+                    ),
+                    json={"inTimeline": in_timeline},
+                    timeout=self.timeout,
+                )
+            )
+            return getattr(r, "status_code", None) in (200, 201)
+        except Exception:
+            return False
+
+    def _ensure_partners_searchable(self) -> List[str]:
+        """Ensure shared-with partner timelines are visible to /search/metadata.
+
+        Immich's POST /search/metadata filters partner assets via
+        `getMyPartnerIds({ timelineEnabled: true })`. When a partner shares
+        their timeline with `inTimeline=False` ("Show in timeline" off, viewed
+        under Partners), /search/metadata excludes all of that partner's photos.
+        Temporarily enabling `inTimeline=True` for the migration run makes
+        /search/metadata include them; `close()` restores `inTimeline=False`.
+        """
+        if self._partners_checked:
+            return self._partner_ids
+        self._partners_checked = True
+        for partner in self.list_partners("shared-with"):
+            pid = partner.get("id")
+            if not pid:
+                continue
+            self._partner_ids.append(pid)
+            if not partner.get("inTimeline"):
+                if self.set_partner_in_timeline(pid, True):
+                    self._restorable_partner_ids.append(pid)
+        return self._partner_ids
+
+    def get_asset(self, asset_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch metadata for a single asset by UUID."""
+        try:
+            r = self._retry(
+                lambda: self._request(
+                    "get",
+                    f"{self.base_url}/assets/{asset_id}",
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+            )
+            if getattr(r, "status_code", None) != 200:
+                return None
+            data = r.json()
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _iter_partner_timeline_assets(self, partner_id: str):
+        """Yield assets from a partner's timeline buckets as a fallback when
+        POST /search/metadata does not return that partner's assets (e.g. if
+        the API key lacks `partner.update` or on older Immich servers).
+        """
+        def _get_buckets(params: Dict[str, Any]):
+            return self._retry(
+                lambda: self._request(
+                    "get",
+                    f"{self.base_url}/timeline/buckets",
+                    headers=self._headers(),
+                    params=params,
+                    timeout=self.timeout,
+                )
+            )
+
+        try:
+            r = _get_buckets({"userId": partner_id, "size": "MONTH"})
+            if getattr(r, "status_code", None) == 400:
+                r = _get_buckets({"userId": partner_id})
+            if getattr(r, "status_code", None) != 200:
+                return
+            buckets = r.json()
+        except Exception:
+            return
+
+        if not isinstance(buckets, list):
+            return
+
+        for b in buckets:
+            tb = b.get("timeBucket") if isinstance(b, dict) else None
+            if not tb:
+                continue
+
+            def _get_bucket(params: Dict[str, Any]):
+                return self._retry(
+                    lambda: self._request(
+                        "get",
+                        f"{self.base_url}/timeline/bucket",
+                        headers=self._headers(),
+                        params=params,
+                        timeout=self.timeout,
+                    )
+                )
+
+            try:
+                rb = _get_bucket(
+                    {"userId": partner_id, "timeBucket": tb, "size": "MONTH"}
+                )
+                if getattr(rb, "status_code", None) == 400:
+                    rb = _get_bucket(
+                        {"userId": partner_id, "timeBucket": tb}
+                    )
+                if getattr(rb, "status_code", None) != 200:
+                    continue
+                bdata = rb.json()
+            except Exception:
+                continue
+
+            if isinstance(bdata, list):
+                for it in bdata:
+                    if isinstance(it, dict) and it.get("id"):
+                        yield it
+            elif isinstance(bdata, dict):
+                ids = bdata.get("id") or []
+                if not isinstance(ids, list):
+                    continue
+                names = bdata.get("originalFileName")
+                dtos = (
+                    bdata.get("fileCreatedAt")
+                    or bdata.get("localDateTime")
+                    or []
+                )
+                libs = bdata.get("libraryId") or []
+                paths = bdata.get("originalPath") or []
+                if isinstance(names, list) and len(names) == len(ids):
+                    for idx, aid in enumerate(ids):
+                        dto = dtos[idx] if idx < len(dtos) else None
+                        lib = libs[idx] if idx < len(libs) else None
+                        path = paths[idx] if idx < len(paths) else None
+                        if not lib and not path:
+                            asset = self.get_asset(str(aid))
+                            if asset and asset.get("id"):
+                                asset.setdefault("ownerId", partner_id)
+                                yield asset
+                                continue
+                        yield {
+                            "id": aid,
+                            "originalFileName": names[idx],
+                            "exifInfo": {"dateTimeOriginal": dto},
+                            "libraryId": lib or f"partner:{partner_id}",
+                            "originalPath": path,
+                            "ownerId": partner_id,
+                        }
+                else:
+                    for aid in ids:
+                        if not isinstance(aid, str):
+                            continue
+                        asset = self.get_asset(aid)
+                        if asset and asset.get("id"):
+                            yield asset
 
     def list_albums(
         self, shared: Optional[bool] = None
@@ -443,6 +643,30 @@ class ImmichClient:
             ok = len(asset_ids)
         return ok, fail
 
+    def remove_assets_from_album(
+        self, album_id: str, asset_ids: List[str]
+    ) -> bool:
+        """Remove assets from an album."""
+        if not asset_ids:
+            return True
+
+        def _do():
+            return self._request(
+                "delete",
+                f"{self.base_url}/albums/{album_id}/assets",
+                headers=self._headers(
+                    {"Content-Type": "application/json"}
+                ),
+                json={"ids": asset_ids},
+                timeout=120,
+            )
+
+        try:
+            r = self._retry(_do)
+            return getattr(r, "status_code", None) in (200, 201, 204)
+        except Exception:
+            return False
+
     def search_assets(
         self, size: int = 1000
     ) -> Dict[str, Any]:
@@ -464,7 +688,8 @@ class ImmichClient:
 
     def iter_assets(self, page_size: int = 1000):
         """Yield every asset visible to this API key, across ALL libraries
-        (the user's upload library AND any external libraries).
+        (the user's upload library, external libraries, AND timelines shared
+        with this user by partners).
 
         Paginates POST /search/metadata. `withExif` is requested so each
         item carries `exifInfo.dateTimeOriginal`, which external-library
@@ -476,6 +701,9 @@ class ImmichClient:
         content-checksum dedup can never match a file that lives in an
         external library; matching has to be done on metadata instead.
         """
+        partner_ids = self._ensure_partners_searchable()
+        seen_ids = set()
+        seen_owners = set()
         page = 1
         while True:
             def _do(p=page):
@@ -487,7 +715,6 @@ class ImmichClient:
                     json={
                         "page": p,
                         "size": page_size,
-                        "withExif": True,
                     },
                     timeout=self.timeout,
                 )
@@ -497,6 +724,12 @@ class ImmichClient:
             data = self._retry(_do)
             assets = data.get("assets", {}) or {}
             for it in assets.get("items", []) or []:
+                aid = it.get("id")
+                if aid:
+                    seen_ids.add(aid)
+                owner_id = it.get("ownerId")
+                if owner_id:
+                    seen_owners.add(owner_id)
                 yield it
             nxt = assets.get("nextPage")
             if not nxt:
@@ -505,6 +738,23 @@ class ImmichClient:
                 page = int(nxt)
             except (TypeError, ValueError):
                 break
+
+        # If any shared-with partner's assets were not returned by
+        # POST /search/metadata (e.g. `inTimeline` could not be toggled or
+        # the server version scopes /search/metadata strictly to the caller),
+        # enumerate their timeline buckets directly.
+        if partner_ids:
+            self._partner_fallback_assets = []
+            for pid in partner_ids:
+                if pid in seen_owners:
+                    continue
+                for it in self._iter_partner_timeline_assets(pid):
+                    aid = it.get("id")
+                    if not aid or aid in seen_ids:
+                        continue
+                    seen_ids.add(aid)
+                    self._partner_fallback_assets.append(it)
+                    yield it
 
     def build_filename_index(
         self, page_size: int = 1000
@@ -528,7 +778,9 @@ class ImmichClient:
             aid = a.get("id")
             if not name or not aid:
                 continue
-            dto = (a.get("exifInfo") or {}).get("dateTimeOriginal")
+            dto = (a.get("exifInfo") or {}).get("dateTimeOriginal") or a.get(
+                "fileCreatedAt"
+            )
             index.setdefault(name.lower(), []).append(
                 (aid, dto, a.get("libraryId"), a.get("originalPath"))
             )
@@ -554,10 +806,12 @@ class ImmichClient:
         """
         if not filename:
             return []
+        self._ensure_partners_searchable()
         target = filename.lower()
         results: List[
             Tuple[str, Optional[str], Optional[str], Optional[str]]
         ] = []
+        seen_ids = set()
         page = 1
         while True:
             def _do(p=page):
@@ -570,7 +824,6 @@ class ImmichClient:
                         "page": p,
                         "size": page_size,
                         "originalFileName": filename,
-                        "withExif": True,
                     },
                     timeout=self.timeout,
                 )
@@ -588,7 +841,8 @@ class ImmichClient:
                     continue
                 dto = (it.get("exifInfo") or {}).get(
                     "dateTimeOriginal"
-                )
+                ) or it.get("fileCreatedAt")
+                seen_ids.add(aid)
                 results.append(
                     (aid, dto, it.get("libraryId"), it.get("originalPath"))
                 )
@@ -599,4 +853,19 @@ class ImmichClient:
                 page = int(nxt)
             except (TypeError, ValueError):
                 break
+
+        for it in self._partner_fallback_assets:
+            name = it.get("originalFileName")
+            aid = it.get("id")
+            if not name or not aid or aid in seen_ids:
+                continue
+            if name.lower() != target:
+                continue
+            dto = (it.get("exifInfo") or {}).get(
+                "dateTimeOriginal"
+            ) or it.get("fileCreatedAt")
+            seen_ids.add(aid)
+            results.append(
+                (aid, dto, it.get("libraryId"), it.get("originalPath"))
+            )
         return results

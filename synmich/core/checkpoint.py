@@ -341,6 +341,9 @@ class Checkpoint:
             self.data.setdefault("syno_to_immich", {}).setdefault(user, {})[
                 str(syno_id)
             ] = immich_id
+            self.data.get("failed_items", {}).get(user, {}).pop(
+                str(syno_id), None
+            )
             key = "duplicate" if was_duplicate else "uploaded"
             self.data["counters"][key] = (
                 self.data["counters"].get(key, 0) + 1
@@ -357,6 +360,9 @@ class Checkpoint:
             self.data.setdefault("syno_to_immich", {}).setdefault(user, {})[
                 str(syno_id)
             ] = immich_id
+            self.data.get("failed_items", {}).get(user, {}).pop(
+                str(syno_id), None
+            )
             self.data["counters"]["linked"] = (
                 self.data["counters"].get("linked", 0) + 1
             )
@@ -366,12 +372,18 @@ class Checkpoint:
             self.data.setdefault("syno_to_immich", {}).setdefault(user, {})[
                 str(syno_id)
             ] = immich_id
+            self.data.get("failed_items", {}).get(user, {}).pop(
+                str(syno_id), None
+            )
             self.data["counters"]["duplicate"] = (
                 self.data["counters"].get("duplicate", 0) + 1
             )
 
     def mark_failed(self, user: str, syno_id: str, error: str = "") -> None:
         with self.lock:
+            self.data.get("syno_to_immich", {}).get(user, {}).pop(
+                str(syno_id), None
+            )
             self.data.setdefault("failed_items", {}).setdefault(user, {})[
                 str(syno_id)
             ] = error

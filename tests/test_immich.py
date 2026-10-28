@@ -181,3 +181,115 @@ def test_existing_live_still_gets_explicit_motion_link(tmp_path, link_fails):
         assert "live_photo_link_failed" in result[2]
     else:
         assert result == ("still", True, None)
+
+
+def test_partner_in_timeline_enabled_temporarily_and_restored_on_close():
+    client = ImmichClient("https://immich.example", "key")
+
+    partners_resp = MagicMock(status_code=200)
+    partners_resp.json.return_value = [{"id": "partner-1", "inTimeline": False}]
+    partners_resp.raise_for_status = MagicMock()
+
+    put_resp = MagicMock(status_code=200)
+    put_resp.raise_for_status = MagicMock()
+
+    search_resp = MagicMock(status_code=200)
+    search_resp.json.return_value = {
+        "assets": {
+            "items": [
+                {
+                    "id": "partner-asset-1",
+                    "ownerId": "partner-1",
+                    "originalFileName": "IMG_9999.HEIC",
+                    "originalPath": "/homes/partner/IMG_9999.HEIC",
+                    "libraryId": "lib-partner",
+                    "fileCreatedAt": "2025-07-01T10:00:00Z",
+                }
+            ],
+            "nextPage": None,
+        }
+    }
+    search_resp.raise_for_status = MagicMock()
+
+    with patch("synmich.core.immich.requests.Session.get", return_value=partners_resp):
+        with patch("synmich.core.immich.requests.Session.put", return_value=put_resp) as put:
+            with patch("synmich.core.immich.requests.Session.post", return_value=search_resp):
+                assets = list(client.iter_assets())
+                assert len(assets) == 1
+                assert assets[0]["id"] == "partner-asset-1"
+                assert put.call_count == 1
+                assert put.call_args.args[0] == "https://immich.example/api/partners/partner-1"
+                assert put.call_args.kwargs["json"] == {"inTimeline": True}
+
+                client.close()
+                assert put.call_count == 2
+                assert put.call_args.args[0] == "https://immich.example/api/partners/partner-1"
+                assert put.call_args.kwargs["json"] == {"inTimeline": False}
+
+
+def test_partner_timeline_bucket_fallback_when_search_excludes_partner():
+    client = ImmichClient("https://immich.example", "key")
+
+    partners_resp = MagicMock(status_code=200)
+    partners_resp.json.return_value = [{"id": "partner-1", "inTimeline": False}]
+    partners_resp.raise_for_status = MagicMock()
+
+    put_resp = MagicMock(status_code=200)
+    put_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("403 Forbidden")
+
+    # Search only returns own assets (partner-1 is missing from search results)
+    search_resp = MagicMock(status_code=200)
+    search_resp.json.return_value = {
+        "assets": {
+            "items": [
+                {
+                    "id": "own-asset-1",
+                    "ownerId": "me",
+                    "originalFileName": "IMG_0001.JPG",
+                    "originalPath": "/homes/me/IMG_0001.JPG",
+                    "libraryId": "lib-me",
+                    "fileCreatedAt": "2025-01-01T00:00:00Z",
+                }
+            ],
+            "nextPage": None,
+        }
+    }
+    search_resp.raise_for_status = MagicMock()
+
+    buckets_resp = MagicMock(status_code=200)
+    buckets_resp.json.return_value = [{"timeBucket": "2025-07-01T00:00:00.000Z", "count": 1}]
+    buckets_resp.raise_for_status = MagicMock()
+
+    # Columnar timeline bucket response (Immich >= 1.133) where originalPath is absent
+    bucket_resp = MagicMock(status_code=200)
+    bucket_resp.json.return_value = {
+        "id": ["partner-asset-2"],
+        "originalFileName": ["IMG_2222.HEIC"],
+        "fileCreatedAt": ["2025-07-15T12:00:00Z"],
+        "ownerId": ["partner-1"],
+    }
+    bucket_resp.raise_for_status = MagicMock()
+
+    detail_resp = MagicMock(status_code=200)
+    detail_resp.json.return_value = {
+        "id": "partner-asset-2",
+        "ownerId": "partner-1",
+        "originalFileName": "IMG_2222.HEIC",
+        "originalPath": "/homes/partner/IMG_2222.HEIC",
+        "libraryId": "lib-partner",
+        "fileCreatedAt": "2025-07-15T12:00:00Z",
+    }
+    detail_resp.raise_for_status = MagicMock()
+
+    with patch(
+        "synmich.core.immich.requests.Session.get",
+        side_effect=[partners_resp, buckets_resp, bucket_resp, detail_resp],
+    ):
+        with patch("synmich.core.immich.requests.Session.put", return_value=put_resp):
+            with patch("synmich.core.immich.requests.Session.post", return_value=search_resp):
+                idx = client.build_filename_index()
+
+    assert "img_0001.jpg" in idx
+    assert "img_2222.heic" in idx
+    assert idx["img_2222.heic"][0][0] == "partner-asset-2"
+    assert idx["img_2222.heic"][0][2] == "lib-partner"

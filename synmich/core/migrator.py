@@ -11,7 +11,7 @@ from concurrent.futures import (
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from synmich.core.synology import SynologyClient
 from synmich.core.immich import ImmichClient
@@ -26,6 +26,15 @@ _STATS_LOCK = threading.Lock()
 # differences between Synology's capture time and Immich's dateTimeOriginal,
 # tight enough that two genuinely different shots won't be confused.
 _DATE_MATCH_TOLERANCE_S = 120
+
+# Maximum timezone shift (seconds) tolerated when comparing Synology's
+# capture timestamp (which Synology Photos often stores as local camera
+# wall-clock time encoded as a UTC epoch) against Immich's UTC timestamp.
+_TZ_MATCH_TOLERANCE_S = 14 * 3600 + 120
+_SINGLE_VIDEO_TZ_TOLERANCE_S = _TZ_MATCH_TOLERANCE_S
+
+_DATE_PREFIX_RE = re.compile(r"^(?:[A-Za-z]+_)?\d{4}[-_]?\d{2}[-_]?\d{2}")
+_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
 
 _ISO_RE = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})"
@@ -60,6 +69,67 @@ def _iso_to_epoch(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _path_or_name_matches_year_month(
+    filename: Optional[str],
+    path: Optional[str],
+    capture_epoch: Optional[float],
+) -> bool:
+    """Return True if the candidate's folder path or filename explicitly
+    encodes the capture year and month (handling external-library files whose
+    EXIF has not been extracted by Immich yet, so `fileCreatedAt` in Immich is
+    the file's copy/modification date on the NAS).
+    """
+    if capture_epoch is None:
+        return False
+    norm_path = (path or "").replace("\\", "/")
+    text = f"{norm_path} / {filename or ''}"
+    for shift in (0, -14 * 3600, 14 * 3600):
+        try:
+            dt = datetime.fromtimestamp(capture_epoch + shift, timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            continue
+        yyyy = f"{dt.year:04d}"
+        yy = f"{dt.year % 100:02d}"
+        mm = f"{dt.month:02d}"
+        pat = (
+            rf"(?:^|[/ _-]){yyyy}[/ _-]?{mm}(?:[/ _.-]|\d|$)"
+            rf"|/{yyyy}/{yyyy}{mm}"
+            rf"|/{yyyy}/\d{{4}}-{mm}\d{{2}}\b"
+            rf"|/{yyyy}/[^/]+/{mm}[._-]\d{{2}}[._-]{yy}\b"
+        )
+        if re.search(pat, text):
+            return True
+        if (
+            re.match(rf"^{yy}{mm}[A-Za-z0-9_]", filename or "")
+            and f"/{yyyy}/" in norm_path
+        ):
+            return True
+    return False
+
+
+def _single_candidate_date_ok(
+    filename: str,
+    dto: Optional[str],
+    capture_epoch: Optional[float],
+    path: Optional[str] = None,
+) -> bool:
+    """Verify that a single filename match is not an unrelated photo from
+    another date (e.g. a generic `IMG_1234.HEIC` in the user's own timeline
+    when the actual partner photo wasn't indexed yet).
+    """
+    if capture_epoch is None:
+        return True
+    ep = _iso_to_epoch(dto)
+    if ep is None:
+        return True
+    diff = abs(ep - capture_epoch)
+    if diff <= _TZ_MATCH_TOLERANCE_S:
+        return True
+    if _path_or_name_matches_year_month(filename, path, capture_epoch):
+        return True
+    return False
+
+
 def match_existing_asset(
     index: Dict[str, List[Tuple]],
     filename: str,
@@ -72,11 +142,12 @@ def match_existing_asset(
     {filename.lower(): [(asset_id, dateTimeOriginal, libraryId, originalPath), ...]}.
     Plain 2- and 3-tuples from older indexes/tests are also accepted.
 
-    A single same-named asset is taken as the match (filename is the strong
-    key — e.g. nino's `2025-09-18_12-54-48_IMG_6054.HEIC` prefix is unique).
-    When several assets share the filename, we disambiguate by capture date
-    and require a hit within _DATE_MATCH_TOLERANCE_S; if none qualifies we
-    return None so the caller uploads rather than risk linking the wrong shot.
+    A single same-named asset is taken as the match when its capture date is
+    compatible (or unavailable). When several assets share the filename, we
+    disambiguate by capture date and require a hit within
+    _DATE_MATCH_TOLERANCE_S (or timezone-shifted _TZ_MATCH_TOLERANCE_S /
+    explicit year-month path match); if none qualifies we return None so the
+    caller does not risk linking the wrong shot.
 
     When more than one asset qualifies — e.g. the photo exists both as an
     external-library asset and as a leftover copy in the upload library from
@@ -104,14 +175,21 @@ def match_existing_asset(
     ]
 
     if len(norm) == 1:
-        return norm[0][0]
+        if _single_candidate_date_ok(
+            filename, norm[0][1], capture_epoch, norm[0][3]
+        ):
+            return norm[0][0]
+        return None
 
-    # If exactly one external-library asset has this exact filename, prefer it
-    # even when video metadata timestamps disagree. Some cameras/containers
-    # expose video capture times in a different zone than Synology's album item
-    # time; the exact filename is still stronger than leftover upload copies.
+    # If exactly one external-library asset has this exact filename and a
+    # compatible capture date, prefer it even when video metadata timestamps
+    # disagree by a timezone offset. Some cameras/containers expose video
+    # capture times in a different zone than Synology's album item time; the
+    # exact filename is still stronger than leftover upload copies.
     external = [c for c in norm if c[2] is not None]
-    if len(external) == 1:
+    if len(external) == 1 and _single_candidate_date_ok(
+        filename, external[0][1], capture_epoch, external[0][3]
+    ):
         return external[0][0]
 
     if capture_epoch is None:
@@ -125,23 +203,29 @@ def match_existing_asset(
         parts = [p.lower() for p in re.split(r"[\\/]+", str(path)) if p]
         return owner in parts
 
-    # Keep every same-named asset whose capture date is within tolerance, then
+    # Keep every same-named asset whose capture date is within tolerance (or
+    # timezone-shifted tolerance / explicit year-month path match), then
     # prefer external assets. If date proximity ties, prefer the external path
     # that belongs to the current Synology user.
-    qualifying = []  # (is_upload_copy, date_diff, not_owner_path, asset_id)
+    qualifying = []  # (is_upload_copy, tier, date_diff, not_owner_path, asset_id)
     for aid, dto, lib, path in norm:
         ep = _iso_to_epoch(dto)
-        if ep is None:
-            continue
-        diff = abs(ep - capture_epoch)
+        diff = abs(ep - capture_epoch) if ep is not None else float("inf")
         if diff <= _DATE_MATCH_TOLERANCE_S:
-            qualifying.append(
-                (lib is None, diff, not owner_path_match(path), aid)
-            )
+            tier = 0
+        elif diff <= _TZ_MATCH_TOLERANCE_S:
+            tier = 1
+        elif _path_or_name_matches_year_month(filename, path, capture_epoch):
+            tier = 2
+        else:
+            continue
+        qualifying.append(
+            (lib is None, tier, diff, not owner_path_match(path), aid)
+        )
     if not qualifying:
         return None
-    qualifying.sort(key=lambda q: (q[0], q[1], q[2]))
-    return qualifying[0][3]
+    qualifying.sort(key=lambda q: (q[0], q[1], q[2], q[3]))
+    return qualifying[0][4]
 
 
 @dataclass
@@ -404,6 +488,10 @@ class Migrator:
             Tuple[str, str], List[Tuple[str, Optional[str], Optional[str]]]
         ] = {}
         self._fallback_lock = threading.Lock()
+        # Track stale/false-matched asset IDs replaced during external-library
+        # re-evaluation so they can be removed from the Immich album.
+        self._replaced_assets: Set[str] = set()
+        self._replaced_lock = threading.Lock()
 
         # Filters
         filters = config.get("filters", {})
@@ -507,11 +595,14 @@ class Migrator:
         return True
 
     def _determine_uploader(
-        self, owner_user_id: int
+        self, owner_user_id: Optional[int]
     ) -> Optional[UserSession]:
-        if owner_user_id == 0:
+        if owner_user_id == 0 or owner_user_id is None:
             return self.shared_owner
-        return self.syno_id_to_session.get(owner_user_id)
+        return (
+            self.syno_id_to_session.get(owner_user_id)
+            or self.shared_owner
+        )
 
     def _get_asset_index(
         self, uploader: UserSession
@@ -577,6 +668,56 @@ class Migrator:
             self._fallback_cache[key] = candidates
         return candidates
 
+    def _find_external_match(
+        self,
+        uploader: UserSession,
+        filename: str,
+        capture: Optional[float],
+    ) -> Tuple[Optional[str], UserSession, Set[str]]:
+        """Search `uploader` (and any other configured sessions) for an
+        existing Immich asset matching `filename` + `capture`.
+
+        Returns (matched_asset_id, session_that_matched, seen_candidate_ids).
+        """
+        candidate_ids: Set[str] = set()
+        sessions_to_try = [uploader] + [
+            s for s in self.sessions if s.name != uploader.name
+        ]
+        for sess in sessions_to_try:
+            index = self._get_asset_index(sess)
+            idx_candidates = index.get(filename.lower()) or []
+            for c in idx_candidates:
+                if c and c[0]:
+                    candidate_ids.add(c[0])
+            existing_id = match_existing_asset(
+                index, filename, capture, owner_name=sess.name
+            )
+            if existing_id is None:
+                # Bulk index miss isn't proof the asset is absent — the
+                # full-library scan can drop rows at page boundaries, or the
+                # bulk index may only hold a different user's same-named photo.
+                # Confirm with a targeted exact-name query.
+                candidates = self._lookup_by_filename(sess, filename)
+                for c in candidates:
+                    if c and c[0]:
+                        candidate_ids.add(c[0])
+                if candidates:
+                    merged = list(idx_candidates)
+                    seen_c = {c[0] for c in merged if c}
+                    for c in candidates:
+                        if c and c[0] not in seen_c:
+                            merged.append(c)
+                            seen_c.add(c[0])
+                    existing_id = match_existing_asset(
+                        {filename.lower(): merged},
+                        filename,
+                        capture,
+                        owner_name=sess.name,
+                    )
+            if existing_id:
+                return existing_id, sess, candidate_ids
+        return None, uploader, candidate_ids
+
     def _upload_asset(self, uploader: UserSession, filepath: Path, **kwargs):
         started = time.perf_counter()
         try:
@@ -601,7 +742,7 @@ class Migrator:
         existing = self.checkpoint.is_uploaded(
             uploader.name, syno_id
         )
-        if existing:
+        if existing and not self.external_library_mode:
             return existing, uploader.name
 
         # Video filter — note that "live" type is an iPhone Live Photo
@@ -637,34 +778,30 @@ class Migrator:
         # served from an external library), link that asset to the album
         # instead of downloading and re-uploading a duplicate copy.
         if self.external_library_mode:
-            index = self._get_asset_index(uploader)
             filename = item.get("filename", "")
             capture = self._item_timestamp(item)
-            existing_id = match_existing_asset(
-                index, filename, capture, owner_name=uploader.name
+            existing_id, matched_sess, candidate_ids = (
+                self._find_external_match(uploader, filename, capture)
             )
-            if existing_id is None:
-                # Bulk index miss isn't proof the asset is absent — the
-                # full-library scan can drop rows at page boundaries. Confirm
-                # with a targeted exact-name query before deciding to upload a
-                # duplicate.
-                candidates = self._lookup_by_filename(
-                    uploader, filename
-                )
-                if candidates:
-                    existing_id = match_existing_asset(
-                        {filename.lower(): candidates},
-                        filename,
-                        capture,
-                        owner_name=uploader.name,
-                    )
             if existing_id:
-                self.checkpoint.mark_linked(
-                    uploader.name, syno_id, existing_id
-                )
-                self.stats.bump("linked")
-                self._log(f"🔗 Linked (external): {filename}")
-                return existing_id, uploader.name
+                if existing and existing != existing_id:
+                    with self._replaced_lock:
+                        self._replaced_assets.add(existing)
+                if existing != existing_id:
+                    self.checkpoint.mark_linked(
+                        matched_sess.name, syno_id, existing_id
+                    )
+                    self.stats.bump("linked")
+                    self._log(f"🔗 Linked (external): {filename}")
+                return existing_id, matched_sess.name
+            if existing:
+                if existing in candidate_ids:
+                    # Previously linked to a same-named asset whose capture
+                    # date conflicts with this item (false match).
+                    with self._replaced_lock:
+                        self._replaced_assets.add(existing)
+                else:
+                    return existing, uploader.name
             if not self.external_library_fallback_upload:
                 self.checkpoint.mark_failed(
                     uploader.name, syno_id, error="external_match_not_found"
@@ -810,6 +947,39 @@ class Migrator:
 
         return asset_id, uploader.name
 
+    def _album_needs_external_recheck(
+        self, album_items: List[Dict[str, Any]]
+    ) -> bool:
+        """Return True if a completed album has unlinked items (e.g. partner
+        items skipped by older builds) or false-matched items whose capture
+        date conflicts with the checkpointed asset.
+        """
+        for it in album_items:
+            if not isinstance(it, dict) or "id" not in it:
+                continue
+            if not self.include_videos and it.get("type") == "video":
+                continue
+            if not self._in_date_range(it):
+                continue
+            uploader = self._determine_uploader(it.get("owner_user_id"))
+            if not uploader:
+                continue
+            syno_id = str(it["id"])
+            existing = self.checkpoint.is_uploaded(uploader.name, syno_id)
+            if not existing:
+                return True
+            filename = it.get("filename", "")
+            capture = self._item_timestamp(it)
+            if capture is not None and filename:
+                matched_id, _, candidate_ids = self._find_external_match(
+                    uploader, filename, capture
+                )
+                if matched_id and matched_id != existing:
+                    return True
+                if matched_id is None and existing in candidate_ids:
+                    return True
+        return False
+
     def _process_album(
         self, album: Dict[str, Any]
     ) -> None:
@@ -834,10 +1004,17 @@ class Migrator:
             if _shared_oid is not None and _shared_oid > 0
             else album.get("owner_user_id")
         )
+        is_shared = bool(album.get("shared")) or bool(
+            sharing.get("permission")
+        )
         if owner_syno_id == 0:
             owner_guess = self.shared_owner
         else:
-            owner_guess = self.syno_id_to_session.get(owner_syno_id)
+            owner_guess = self.syno_id_to_session.get(owner_syno_id) or (
+                self.shared_owner
+                if is_shared or self.external_library_mode
+                else None
+            )
         owner_name = owner_guess.name if owner_guess else ""
         passphrase = album_key(owner_name, album) if owner_name else (
             album.get("passphrase") or f"local-{album['id']}"
@@ -854,9 +1031,13 @@ class Migrator:
         already_done = self.checkpoint.is_album_done(passphrase) or (
             legacy_key != passphrase and self.checkpoint.is_album_done(legacy_key)
         )
-        if already_done and owner_guess and self.checkpoint.has_failed_items():
-            # Older versions marked albums done despite failed downloads.
-            # Reopen only albums containing unresolved failures, without
+        if already_done and owner_guess and (
+            self.checkpoint.has_failed_items()
+            or self.external_library_mode
+        ):
+            # Older versions marked albums done despite failed downloads or
+            # skipped/mis-linked partner items in external-library mode.
+            # Reopen only albums containing unresolved items, without
             # forcing users to reset all of their migration progress.
             try:
                 album_items = owner_guess.syno.list_items(album_id=album["id"])
@@ -866,14 +1047,17 @@ class Migrator:
             if self.checkpoint.has_failed_items([str(it["id"]) for it in album_items]):
                 already_done = False
                 self._log(f"↻ Retrying failed items in previously completed album: {name}")
+            elif (
+                self.external_library_mode
+                and isinstance(album_items, list)
+                and self._album_needs_external_recheck(album_items)
+            ):
+                already_done = False
+                self._log(f"↻ Re-evaluating incomplete or mis-linked items in album: {name}")
         if already_done:
             self._log(f"⏭ Already done: {name}")
             self.stats.albums_done += 1
             return
-
-        is_shared = bool(album.get("shared")) or bool(
-            sharing.get("permission")
-        )
 
         # Shared albums handling based on mode
         if is_shared:
@@ -900,6 +1084,10 @@ class Migrator:
         else:
             owner = self.syno_id_to_session.get(
                 owner_syno_id
+            ) or (
+                self.shared_owner
+                if is_shared or self.external_library_mode
+                else None
             )
 
         if not owner:
@@ -966,6 +1154,9 @@ class Migrator:
             self.stats.albums_done += 1
             return
 
+        with self._replaced_lock:
+            self._replaced_assets.clear()
+
         # Process items (parallel or sequential)
         uploaded_by_uploader: Dict[str, List[str]] = {}
         folder = (
@@ -988,6 +1179,15 @@ class Migrator:
         if not self.control.check():
             self.checkpoint.save()
             return
+
+        valid_album_assets: Set[str] = set()
+        for ids in uploaded_by_uploader.values():
+            valid_album_assets.update(ids)
+        with self._replaced_lock:
+            stale_ids = sorted(self._replaced_assets - valid_album_assets)
+            self._replaced_assets.clear()
+        if stale_ids:
+            owner.immich.remove_assets_from_album(immich_album_id, stale_ids)
 
         # Add to album per uploader (with their own API key).
         # v1.0.2: if a user's API key gets `no_permission` on some
@@ -1076,9 +1276,10 @@ class Migrator:
                 visible_user_ids.add(uid)
 
         # Choose an owner to list items (any owner that can see)
-        list_owner = self.syno_id_to_session.get(owner_syno_id)
-        if not list_owner and owner_syno_id == 0:
-            list_owner = self.shared_owner
+        list_owner = (
+            self.syno_id_to_session.get(owner_syno_id)
+            or self.shared_owner
+        )
         if not list_owner:
             self._log(
                 f"⚠ {name}: no session to list items"
