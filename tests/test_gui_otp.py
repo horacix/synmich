@@ -11,6 +11,7 @@ pytest.importorskip("customtkinter")
 
 from synmich.gui.app import SynmichApp
 from synmich.gui.dialogs import prompt_otp
+from synmich.gui.views.migration import MigrationView
 
 
 def test_nested_otp_dialog_is_owned_by_account_form_and_restores_grab():
@@ -43,3 +44,47 @@ def test_otp_dialog_exception_unblocks_login_worker():
     worker.join(timeout=2)
     assert not worker.is_alive()
     assert result == [""]
+
+
+def test_migration_view_pull_and_dry_run_wiring():
+    view = MigrationView.__new__(MigrationView)
+    view.cfg = {
+        "migration": {
+            "include_shared_space": True,
+            "shared_space_owner": "Alice",
+        },
+        "users": [
+            {"name": "Alice", "syno_username": "alice"},
+            {"name": "Bob", "syno_username": "bob"},
+        ],
+    }
+    view.toggle_mode = MagicMock()
+    view.toggle_mode.get.return_value = "All albums"
+    view.toggle_shared = MagicMock()
+    view.toggle_shared.get.return_value = "mirror-syno"
+    view.var_timeline = MagicMock()
+    view.var_timeline.get.return_value = True
+    view.var_shared_space = MagicMock()
+    view.var_shared_space.get.return_value = True
+    view.opt_shared_owner = MagicMock()
+    view.opt_shared_owner.get.return_value = "Bob"
+    view.var_external = MagicMock()
+    view.var_external.get.return_value = False
+    view.var_dry_run = MagicMock()
+    view.var_dry_run.get.return_value = True
+    view.album_vars = {}
+
+    view._pull()
+    assert view.cfg["migration"]["include_shared_space"] is True
+    assert view.cfg["migration"]["shared_space_owner"] == "Bob"
+
+    view.var_shared_space.get.return_value = False
+    view._pull()
+    assert view.cfg["migration"]["include_shared_space"] is False
+    assert view.cfg["migration"]["shared_space_owner"] == ""
+
+    view.refresh_users_options()
+    view.opt_shared_owner.configure.assert_called_with(
+        values=["Alice", "Bob"], state="normal"
+    )
+    view.opt_shared_owner.set.assert_called_with("Alice")

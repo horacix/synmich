@@ -546,3 +546,31 @@ def test_completed_album_with_false_matched_random_photo_is_repaired(tmp_path):
     uploader.immich.remove_assets_from_album.assert_called_once_with("album-1", ["own-wrong-date"])
     uploader.immich.add_assets_to_album.assert_called_once_with("album-1", ["partner-right-date"])
     assert mig.checkpoint.is_album_done("p-repair")
+
+
+def test_dry_run_counts_items_without_persisting_checkpoint(tmp_path):
+    syno = MagicMock()
+    mig = _migrator(tmp_path, syno)
+    mig.dry_run = True
+    mig.include_shared_space = True
+    syno.list_albums.return_value = [{"id": 3, "name": "Trip", "owner_user_id": 1}]
+    syno.list_items.side_effect = [
+        [{"id": 10, "filename": "a.jpg", "owner_user_id": 1}],  # album
+        [{"id": 20, "filename": "b.jpg", "owner_user_id": 1}],  # timeline
+    ]
+    syno.list_shared_space_items.return_value = [
+        {"id": 30, "filename": "c.jpg", "owner_user_id": 1}
+    ]
+
+    mig.run()
+
+    assert mig.stats.albums_done == 1
+    assert mig.stats.uploaded == 3
+    assert not mig.checkpoint.is_album_done("local-cyrille-3")
+    assert not mig.checkpoint.is_shared_space_done()
+    assert not mig.checkpoint.is_timeline_done("cyrille")
+    assert not mig.checkpoint.path.exists()
+    syno.download.assert_not_called()
+    mig.sessions[0].immich.create_album.assert_not_called()
+    mig.sessions[0].immich.upload_asset.assert_not_called()
+

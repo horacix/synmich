@@ -1066,7 +1066,8 @@ class Migrator:
                     f"⏭ Shared album ignored "
                     f"(mode=ignore): {name}"
                 )
-                self.checkpoint.mark_album_done(passphrase)
+                if not self.dry_run:
+                    self.checkpoint.mark_album_done(passphrase)
                 self.stats.albums_done += 1
                 return
             if self.shared_albums_mode == "duplicate":
@@ -1118,7 +1119,7 @@ class Migrator:
             )
             self.stats.items_total = len(items)
             self.stats.items_done = len(items)
-            self.checkpoint.mark_album_done(passphrase)
+            self.stats.bump("uploaded", len(items))
             self.stats.albums_done += 1
             return
 
@@ -1309,7 +1310,7 @@ class Migrator:
                         f"'{name}' for {user_session.name} "
                         f"with {len(user_items)} items"
                     )
-            self.checkpoint.mark_album_done(passphrase)
+                    self.stats.bump("uploaded", len(user_items))
             self.stats.albums_done += 1
             return
 
@@ -1374,7 +1375,8 @@ class Migrator:
                 )
 
             if not self.control.check():
-                self.checkpoint.save()
+                if not self.dry_run:
+                    self.checkpoint.save()
                 return
 
             ids = uploaded_by_uploader.get(
@@ -1479,7 +1481,7 @@ class Migrator:
                     name, []
                 ).append(asset_id)
             self.stats.items_done += 1
-            if self.stats.items_done % 25 == 0:
+            if not self.dry_run and self.stats.items_done % 25 == 0:
                 self.checkpoint.save()
 
     def _process_items_parallel(
@@ -1527,7 +1529,7 @@ class Migrator:
                         name, []
                     ).append(asset_id)
                 self.stats.items_done += 1
-                if self.stats.items_done % 25 == 0:
+                if not self.dry_run and self.stats.items_done % 25 == 0:
                     self.checkpoint.save()
 
     def run_albums(self) -> None:
@@ -1607,7 +1609,8 @@ class Migrator:
                     f"✖ Album '{album.get('name')}': {e}"
                 )
 
-        self.checkpoint.save()
+        if not self.dry_run:
+            self.checkpoint.save()
 
     def run_timeline(self) -> None:
         """Migrate the timeline of each user."""
@@ -1666,13 +1669,15 @@ class Migrator:
                 )
 
             if not self.control.check():
-                self.checkpoint.save()
+                if not self.dry_run:
+                    self.checkpoint.save()
                 return
 
-            self.checkpoint.mark_timeline_done(
-                session.name
-            )
-            self.checkpoint.save()
+            if not self.dry_run:
+                self.checkpoint.mark_timeline_done(
+                    session.name
+                )
+                self.checkpoint.save()
 
     def run_shared_space(self) -> None:
         """Migrate Synology Shared Space (FotoTeam) items.
@@ -1707,8 +1712,6 @@ class Migrator:
             self.stats.items_total = len(items)
             self.stats.items_done = len(items)
             self.stats.bump("uploaded", len(items))
-            self.checkpoint.mark_shared_space_done()
-            self.checkpoint.save()
             return
 
         folder = (
@@ -1792,7 +1795,8 @@ class Migrator:
                 self.run_timeline()
 
             self.stats.current_step = "done"
-            self.checkpoint.save()
+            if not self.dry_run:
+                self.checkpoint.save()
         finally:
             self._stop_keepalives(keepalives)
             for session in self.sessions:

@@ -46,6 +46,7 @@ class MigrationView(ctk.CTkFrame):
         self.control = None
         self._log_count = 0
         self._done = False
+        self._was_dry_run = False
         mig = self.cfg.setdefault("migration", {})
 
         ctk.CTkLabel(self, text="Synology to Immich", font=W.font(20, "bold"),
@@ -101,12 +102,20 @@ class MigrationView(ctk.CTkFrame):
         self.log.pack(fill="x", pady=(8, 0))
 
         # ---- Options + album picker (between header and the Run bar) ----
-        c = W.card(self, "Options")
-        c.pack(side="top", fill="x", padx=16, pady=6)
+        self._mid = W.scroll_frame(self, fg="transparent")
+        self._mid.pack(side="top", fill="both", expand=True, padx=16, pady=6)
+
+        c = W.card(self._mid, "Options")
+        c.pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(c.body, text="Albums to migrate", text_color=W.TEXT,
                      font=W.font(13, "bold")).pack(anchor="w")
+        init_mode = (
+            "Specific albums"
+            if mig.get("albums_mode", "all") == "select"
+            else "All albums"
+        )
         self.toggle_mode = W.SquareToggle(
-            c.body, ["All albums", "Specific albums"], "All albums",
+            c.body, ["All albums", "Specific albums"], init_mode,
             command=self._on_mode)
         self.toggle_mode.pack(anchor="w", pady=(2, 2))
 
@@ -132,6 +141,36 @@ class MigrationView(ctk.CTkFrame):
             hover_color=W.GREEN_DK, checkbox_width=20, checkbox_height=20,
             corner_radius=0, border_width=2, font=W.font(12)).pack(
             anchor="w", pady=(12, 0))
+
+        # Shared Space (FotoTeam): migrate shared library items and assign
+        # them to the selected owner in Immich.
+        self.var_shared_space = ctk.BooleanVar(
+            value=bool(mig.get("include_shared_space", True)))
+        ctk.CTkCheckBox(
+            c.body,
+            text="Import Synology Shared Space photos",
+            variable=self.var_shared_space,
+            command=self._toggle_shared_space_owner,
+            fg_color=W.GREEN, hover_color=W.GREEN_DK,
+            checkbox_width=20, checkbox_height=20,
+            corner_radius=0, border_width=2, font=W.font(12)).pack(
+            anchor="w", pady=(6, 0))
+        self.shared_owner_row = ctk.CTkFrame(c.body, fg_color="transparent")
+        ctk.CTkLabel(
+            self.shared_owner_row,
+            text="Shared Space owner in Immich:",
+            text_color=W.MUTED, font=W.font(11)).pack(side="left", padx=(26, 8))
+        self.opt_shared_owner = ctk.CTkOptionMenu(
+            self.shared_owner_row, values=[""],
+            fg_color=W.GREY, button_color=W.GREEN,
+            button_hover_color=W.GREEN_DK, dropdown_fg_color=W.SIDEBAR,
+            dropdown_hover_color=W.HOVER, text_color="white",
+            corner_radius=0, width=180, height=28, font=W.font(12))
+        self.opt_shared_owner.pack(side="left")
+        self._shared_space_anchor = ctk.CTkFrame(c.body, height=0,
+                                                 fg_color="transparent")
+        self._shared_space_anchor.pack(anchor="w")
+
         # External-library mode: link existing assets instead of re-uploading
         # duplicates when the photos already live in Immich via an external
         # library (see immich-app/immich#7804).
@@ -146,7 +185,21 @@ class MigrationView(ctk.CTkFrame):
             corner_radius=0, border_width=2, font=W.font(12)).pack(
             anchor="w", pady=(6, 0))
 
-        self.albums_card = W.card(self, "Albums (tick the ones to migrate)")
+        # Dry-run mode: simulate the migration without downloading or
+        # uploading anything.
+        self.var_dry_run = ctk.BooleanVar(
+            value=bool(mig.get("dry_run", False)))
+        ctk.CTkCheckBox(
+            c.body,
+            text="Dry run (simulate without downloading or uploading anything)",
+            variable=self.var_dry_run,
+            command=self._on_dry_run_toggle,
+            fg_color=W.ORANGE, hover_color=W.ORANGE_DK,
+            checkbox_width=20, checkbox_height=20,
+            corner_radius=0, border_width=2, font=W.font(12)).pack(
+            anchor="w", pady=(6, 0))
+
+        self.albums_card = W.card(self._mid, "Albums (tick the ones to migrate)")
         top = ctk.CTkFrame(self.albums_card.body, fg_color="transparent")
         top.pack(fill="x")
         W.primary_button(top, "Load albums", self._load, color=W.BLUE,
@@ -167,6 +220,9 @@ class MigrationView(ctk.CTkFrame):
         ctk.CTkLabel(self.albums_box,
                      text="Click \"Load albums\" to choose what to migrate.",
                      text_color=W.MUTED).pack(anchor="w", padx=8, pady=8)
+        self.refresh_users_options()
+        self._toggle_shared_space_owner()
+        self._on_dry_run_toggle()
         self._toggle_albums(
             "Pick" if self.toggle_mode.get() == "Specific albums" else "All")
         W.fix_wrapping(self)
@@ -176,13 +232,46 @@ class MigrationView(ctk.CTkFrame):
         desc = {n: d for n, _v, d in W.SHARED_MODES}.get(name, "")
         self.lbl_shared.configure(text=desc)
 
+    def _toggle_shared_space_owner(self):
+        if self.var_shared_space.get():
+            self.shared_owner_row.pack(anchor="w", pady=(4, 0),
+                                       before=self._shared_space_anchor)
+        else:
+            self.shared_owner_row.pack_forget()
+
+    def _on_dry_run_toggle(self):
+        if self.var_dry_run.get():
+            self.start_btn.configure(
+                text="START DRY RUN (SIMULATE)",
+                fg_color=W.ORANGE, hover_color=W.ORANGE_DK)
+        else:
+            self.start_btn.configure(
+                text="START MIGRATION",
+                fg_color=W.GREEN, hover_color=W.GREEN_DK)
+
+    def refresh_users_options(self):
+        users = self.cfg.get("users", [])
+        names = [u.get("name") or u.get("syno_username") or ""
+                 for u in users]
+        names = [n for n in names if n]
+        mig = self.cfg.get("migration", {})
+        cur = mig.get("shared_space_owner", "")
+        if not names:
+            self.opt_shared_owner.configure(values=[""], state="disabled")
+            self.opt_shared_owner.set("")
+            return
+        self.opt_shared_owner.configure(values=names, state="normal")
+        if cur in names:
+            self.opt_shared_owner.set(cur)
+        else:
+            self.opt_shared_owner.set(names[0])
+
     def _on_mode(self, val):
         self._toggle_albums("Pick" if val == "Specific albums" else "All")
 
     def _toggle_albums(self, value):
         if value == "Pick":
-            self.albums_card.pack(side="top", fill="both", expand=True,
-                                  padx=16, pady=(0, 6))
+            self.albums_card.pack(fill="both", expand=True, pady=(0, 6))
         else:
             self.albums_card.pack_forget()
 
@@ -255,6 +344,7 @@ class MigrationView(ctk.CTkFrame):
                      text="Click \"Load albums\" to choose what to migrate.",
                      text_color=W.MUTED).pack(anchor="w", padx=8, pady=8)
         self.sel_count.configure(text="0 selected")
+        self.refresh_users_options()
 
     def _set_all(self, value):
         for v in self.album_vars.values():
@@ -269,6 +359,9 @@ class MigrationView(ctk.CTkFrame):
         mig["shared_albums_mode"] = W.SHARED_TO_INTERNAL.get(
             self.toggle_shared.get(), "link")
         mig["include_timeline"] = bool(self.var_timeline.get())
+        mig["include_shared_space"] = bool(self.var_shared_space.get())
+        owner = (self.opt_shared_owner.get() or "").strip()
+        mig["shared_space_owner"] = owner if mig["include_shared_space"] else ""
         mig["external_library_mode"] = bool(self.var_external.get())
         if mig["albums_mode"] == "select":
             mig["selected_albums"] = [
@@ -293,12 +386,18 @@ class MigrationView(ctk.CTkFrame):
         self.stats.start_time = time.time()
         self._log_count = 0
         self._done = False
+        self._was_dry_run = bool(self.var_dry_run.get())
         self.log.delete("1.0", "end")
         save_config(self.cfg)
+        if self._was_dry_run:
+            self._set_log(
+                "Dry run mode: simulating migration - no files will be "
+                "downloaded or uploaded to Immich.")
         migrator = Migrator(
             config=self.cfg, sessions=self.app.sessions,
             checkpoint=Checkpoint(config=self.cfg),
-            stats=self.stats, control=self.control)
+            stats=self.stats, control=self.control,
+            dry_run=self._was_dry_run)
         self.start_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal")
         self.stop_btn.configure(state="normal")
@@ -345,22 +444,40 @@ class MigrationView(ctk.CTkFrame):
             self.pause_btn.configure(state="disabled")
             self.stop_btn.configure(state="disabled")
             self.start_btn.configure(state="normal")
-            rows = [("Uploaded", str(s.uploaded), W.GREEN)]
-            if s.linked:
-                rows.append(
-                    ("Linked (external)", str(s.linked), W.GREEN))
-            rows += [
-                ("Duplicate", str(s.duplicate), W.BLUE),
-                ("Failed", str(s.failed), W.RED),
-                ("Albums", str(s.albums_done), W.TEXT),
-                ("Total time", W.fmt_duration(el), W.MUTED)]
-            self.app.last_run = {"label": "Synology to Immich", "rows": rows}
-            linked_txt = f"{s.linked} linked, " if s.linked else ""
-            self._set_log(
-                f"\nMigration complete - {s.uploaded} uploaded, "
-                f"{linked_txt}"
-                f"{s.duplicate} duplicate, {s.failed} failed, "
-                f"{s.albums_done} album(s) in {W.fmt_duration(el)}.")
+            if self._was_dry_run:
+                rows = [
+                    ("Would migrate", str(s.uploaded), W.ORANGE),
+                    ("Albums", str(s.albums_done), W.TEXT),
+                    ("Total time", W.fmt_duration(el), W.MUTED),
+                ]
+                self.app.last_run = {
+                    "label": "Synology to Immich (Dry run)",
+                    "rows": rows,
+                }
+                self._set_log(
+                    f"\nDry run complete - {s.uploaded} photo(s) would be "
+                    f"migrated across {s.albums_done} album(s) in "
+                    f"{W.fmt_duration(el)} (nothing downloaded or uploaded).")
+            else:
+                rows = [("Uploaded", str(s.uploaded), W.GREEN)]
+                if s.linked:
+                    rows.append(
+                        ("Linked (external)", str(s.linked), W.GREEN))
+                rows += [
+                    ("Duplicate", str(s.duplicate), W.BLUE),
+                    ("Failed", str(s.failed), W.RED),
+                    ("Albums", str(s.albums_done), W.TEXT),
+                    ("Total time", W.fmt_duration(el), W.MUTED)]
+                self.app.last_run = {
+                    "label": "Synology to Immich",
+                    "rows": rows,
+                }
+                linked_txt = f"{s.linked} linked, " if s.linked else ""
+                self._set_log(
+                    f"\nMigration complete - {s.uploaded} uploaded, "
+                    f"{linked_txt}"
+                    f"{s.duplicate} duplicate, {s.failed} failed, "
+                    f"{s.albums_done} album(s) in {W.fmt_duration(el)}.")
         else:
             self.after(300, self._poll)
 
